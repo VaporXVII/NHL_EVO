@@ -25,10 +25,10 @@ period of time).
 ## Missing Data Table Schema
 | Field | Data Type | Purpose 
 |-------|-----------|---------|
-| `season` | Integer | stores the season the game is scheduled in |
-| `game_id` | Bigint | stores the game identification number for the game that has missing data | 
-| `last_attempt_dte` | Date | tracks the date of the last retry attempt | 
-| `next_retry_dte` | Date | tracks the date of the next retry attempt, defined as the `last_attempt_dte` + 15 days | 
+| `season` | Integer | season the game is scheduled in |
+| `game_id` | Bigint | game identification number for the game that has missing data | 
+| `last_attempt_dte` | Date | date of the last retry attempt | 
+| `next_retry_dte` | Date | date of the next retry attempt, defined as the `last_attempt_dte` + 15 days | 
 | `attempt_count` | Integer | counter to gauge the number of times a retry has been performed | 
 | `insert_dte` | Timestamp | stamps when the row was inserted | 
 | `update_dte` | Timestamp | stamps when the row was updated | 
