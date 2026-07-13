@@ -29,8 +29,6 @@ def find_games(limit_n: int) -> DataFrame:
 
                     select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
                 )
-                
-                
                 ,
                 games as (
 
@@ -234,13 +232,20 @@ def find_games(limit_n: int) -> DataFrame:
 
                     )
 
-                    select  
+                    select /*+ broadcast (c) */
                         date_format(a.start_time_utc, 'hh:mm a') as game_start_time_cst,
                         a.which_game,
                         a.game_id,
                         a.game_date,
-                        concat('https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId=', game_id) as api_url
+                        concat(
+                                split_part(c.api_url, '{{game_id}}', 1),
+                                a.game_id,
+                                split_part(c.api_url, '{{game_id}}', 2)
+                        ) as api_url
                     from final_games a 
+                    cross join nhl_data_staged.ops.api_urls c 
+                        on c.endpoint = "shift_data"
+                        and c.is_active = true 
                     where 1 = 1
                         --and which_game <> 'loaded but missing data'
                     order by a.game_date, a.game_id

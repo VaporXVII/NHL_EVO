@@ -224,14 +224,22 @@ def find_games(limit_n: int) -> DataFrame:
 
                 )
 
-                select 
+                select /*+ broadcast (c) */
                     date_format(a.start_time_utc, 'hh:mm a') as game_start_time_cst,
                     a.season,
                     a.game_date,
                     a.game_id,
                     a.which_game,
-                    concat("https://api-web.nhle.com/v1/gamecenter/", a.game_id, "/play-by-play") as api_url
+                    concat(
+                            split_part(c.api_url, '{{game_id}}', 1),
+                            a.game_id,
+                            split_part(c.api_url, '{{game_id}}', 2)
+                    ) as api_url
                 from final_games a
+                ---pulls in the active api url for pbp data 
+                cross join nhl_data_staged.ops.api_urls c 
+                    on c.endpoint = "pbp_data"
+                    and c.is_active = true
                 where 1 = 1
                     ---and a.which_game <> "loaded but missing data"
                 order by a.game_date, a.game_id 
