@@ -10,8 +10,8 @@ These records are isolated into quarantine tables instead of being loaded direct
 - `nhl_data_staged.quarantine.shift_data`
 
 - ## Relevant Notebooks
-- NHL_API_Games_PBP_Data_Staged.ipynb: performs the insert into `nhl_data_staged.quarantine.pbp_data` table
-- NHL_API_Games_Shift_Data_Staged.ipynb: performs the insert into `nhl_data_staged.quarantine.shift_data` table
+- NHL_API_Games_PBP_Data_Staged.py: performs the insert into `nhl_data_staged.quarantine.pbp_data` table
+- NHL_API_Games_Shift_Data_Staged.py: performs the insert into `nhl_data_staged.quarantine.shift_data` table
 
 ## Audit & Operations
 | Table | Purpose | Required Fields | Validation Rule |
