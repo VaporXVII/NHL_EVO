@@ -94,7 +94,7 @@ todays_teams = spark.sql("""
                             and a.game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
                             and b.is_active = true
                             and a.game_type in (2,3)
-
+                        
     """)
 ready = not bool(todays_teams.isEmpty())
 
@@ -107,7 +107,7 @@ if ready:
                 .distinct()
     )
     todays_teams_dict = {row["team_abbrev"]: str(row["game_id"]) + '-' + str(row["team_id"]) for row in todays_teams.collect()}
-    team_api_urls = [f"https://api-web.nhle.com/v1/roster/{team}/current/{extra_info}" for team, extra_info in todays_teams_dict.items()]
+    team_api_urls = [f"https://api-web.nhle.com/v1/roster/{team_abbrev}/current/{extra_info}" for team_abbrev, extra_info in todays_teams_dict.items()]
     with ThreadPoolExecutor(max_workers = 5) as executor:
 
         api_data = []
