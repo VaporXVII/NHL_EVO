@@ -13,13 +13,6 @@ spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 central_timezone = ZoneInfo("America/Chicago")
 
-def now_central():
-    return dt.datetime.now(central_timezone)
-
-def today_central():
-    return now_central().date()
-today = today_central()
-
 def wrangle_data(df: DataFrame, pov: str) -> DataFrame:
 
     pov = pov.lower()
@@ -104,6 +97,7 @@ if ready:
     py_source = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get().split("/")[-1]
     sched_raw_schema = get_schema(sched_raw)
     base_fields = [
+
         "season", "game_id", "game_date", "game_type", "startTimeUTC", "easternUTCOffset", "venueUTCOffset", "venueTimezone",
         "regularSeasonStartDate", "regularSeasonEndDate", "preSeasonStartDate", "playoffEndDate", "neutralSite"
     ]
@@ -133,9 +127,13 @@ if ready:
                 f.col("id").alias("game_id"), 
                 f.col("gameType").alias("game_type"), 
                 f.col("date").alias("game_date"), 
-                "easternUTCOffset", "startTimeUTC", "venueTimezone", "venueUTCOffset", 
-                f.col("neutralSite"),
-                "awayTeam", "homeTeam"
+                "easternUTCOffset", 
+                "startTimeUTC", 
+                "venueTimezone", 
+                "venueUTCOffset", 
+                "neutralSite",
+                "awayTeam", 
+                "homeTeam"
         )
     )
 
@@ -172,7 +170,7 @@ if ready:
             t.StructField("unused_structs", t.StringType(), True), 
             t.StructField("num_unused_structs", t.IntegerType(), True)
 
-        ])
+    ])
 
     away_teams = sched_df1.transform(wrangle_data, "away")
     home_teams = sched_df1.transform(wrangle_data, "home")
@@ -254,7 +252,8 @@ if insert_ready:
                 game_type = s.game_type, 
                 unused_structs = s.unused_structs,          
                 num_unused_structs = s.num_unused_structs,
-                update_dte = current_timestamp()    
+                update_dte = current_timestamp(),
+                py_source = s.py_source
                 
             when not matched then insert (
 
@@ -325,7 +324,11 @@ else:
     print(f"No new data to insert into nhl_data_staged.games.schedules, skipping insert")
 if datetime.datetime.today().day % 5 == 0:
     spark.sql("analyze table nhl_data_staged.games.schedules compute statistics;")
+    spark.sql("optimize nhl_data_staged.games.schedules;")
+    spark.sql("vacuum nhl_data_staged.games.schedules;")
     spark.sql("analyze table nhl_data.games.schedules compute statistics;")
+    spark.sql("optimize nhl_data.games.schedules;")
+    spark.sql("vacuum nhl_data.games.schedules;")
 
 if update_ready: 
 
@@ -339,9 +342,9 @@ if update_ready:
             where 1 = 1
                 and game_in_play = true 
                 and (
-                    game_date = date_sub(current_date(), 1) 
+                    game_date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1) 
                     or 
-                    insert_dte::date = date_sub(current_date(), 1)
+                    insert_dte::date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
                     )
             
               """)
@@ -363,9 +366,9 @@ if update_ready:
             where 1 = 1
                 and game_in_play = true 
                 and (
-                    game_date = date_sub(current_date(), 1) 
+                    game_date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
                     or 
-                    insert_dte::date = date_sub(current_date(), 1)
+                    insert_dte::date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
                     )
               
               """)
