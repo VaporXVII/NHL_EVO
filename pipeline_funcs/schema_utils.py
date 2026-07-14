@@ -3,10 +3,11 @@ from typing import Any, Collection, Mapping
 import re 
 
 def convert_case(name: str) -> str:
-    # 1) Split lowercase/digit → uppercase
+
+    #Split lowercase/digit to uppercase
     s1 = re.sub(r'(?<=[a-z0-9])([A-Z])', r'_\1', name)
     
-    # 2) Split acronym → word (UTCOffset → UTC_Offset)
+    #Split acronym -> word (UTCOffset -> UTC_Offset)
     s2 = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', s1)
     
     return s2.lower()
@@ -43,6 +44,18 @@ def build_fields(src_col: str, rule: Mapping[str, Any], df_fields: Collection[st
 
     return expr.cast(dtype).alias(target_col)
 
+
+#function pulls in df schema
+def get_schema(df: DataFrame) -> str:
+
+    return (
+
+        df 
+        .selectExpr("schema_of_json_agg(payload) as schema")
+        .first()
+        ["schema"]
+    )
+
 #takes a df and returns a df with the schema applied (used in for special teams data)
 def unpack_data(df: DataFrame) -> DataFrame:
 
@@ -72,13 +85,40 @@ def unpack_data(df: DataFrame) -> DataFrame:
 
     return d 
 
-def get_schema(df: DataFrame) -> str:
 
-    return (
+def flatten_df(df):
+    
+    while True:
+        complex_fields = [
+            field
+            for field in df.schema.fields
+            if isinstance(field.dataType, (t.StructType, t.ArrayType))
+        ]
 
-        df 
-        .selectExpr("schema_of_json_agg(payload) as schema")
-        .first()
-        ["schema"]
-    )
+        if not complex_fields:
+            break
+
+        field = complex_fields[0]
+        field_name = field.name
+
+        if isinstance(field.dataType, t.StructType):
+            expanded_columns = [
+                f.col(f"`{field_name}`.`{nested_field.name}`").alias(
+                    f"{nested_field.name}"
+                )
+                for nested_field in field.dataType.fields
+            ]
+
+            df = df.select(
+                "*",
+                *expanded_columns
+            ).drop(field_name)
+
+        elif isinstance(field.dataType, t.ArrayType):
+            df = df.withColumn(
+                field_name,
+                f.explode_outer(f.col(f"`{field_name}`"))
+            )
+
+    return df
 
