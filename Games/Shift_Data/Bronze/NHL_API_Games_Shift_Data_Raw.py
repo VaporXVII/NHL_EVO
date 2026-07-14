@@ -16,10 +16,7 @@ from pipeline_funcs.api_utils import *
 spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 
-games = get_games(spark, bronze_table = "nhl_data_raw.games.shift_data")
-ready = not games.isEmpty()
-
-def find_games(limit_n: int) -> DataFrame:
+def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
 
     #SQL below is used as part of batch processing. Since shift data is considerably larger than any other data from the NHL API, 
     #attempting to collect data for all games, without doing batch processing, can cause the Serverless compute cluster to run out of memory
@@ -122,7 +119,7 @@ def find_games(limit_n: int) -> DataFrame:
                         select /*+ broadcast (p) */
                             a.request_key as game_id,
                             a.payload,
-                            from_json(a.payload, 'STRUCT<data: ARRAY<STRING>, total: INT>') as payload_json
+                            from_json(a.payload, '{raw_schema if raw_schema else "STRUCT<>"}') as payload_json
                         from nhl_data_raw.games.shift_data a 
                         cross join date_param p
                         where 1 = 1
@@ -134,11 +131,14 @@ def find_games(limit_n: int) -> DataFrame:
                     games_loaded_missing_data as (
                         
                         ---section below creates a flag to check for games where the shift data is missing, if at least 15 days have passed hit it again
+                        ---this will allow for only one scrape to happen a day since after the first attempt the last_attempt_dte field will get set to the 
+                        ---current date, therefore setting the retry_scrape_ind to false 
                         select /*+ broadcast (p) */
                             a.game_id,
                             coalesce(
                                 (
-                                (p.current_run_date - a.last_attempt_dte::date)::integer >= 15), 
+                                (p.current_run_date - a.last_attempt_dte::date)::integer >= 15
+                                ), 
                                 false
                                 )::boolean as retry_scrape_ind
                         from nhl_data_staged.ops.games_missing_shift a 
@@ -333,7 +333,8 @@ def merge_insert_found(batch_data: DataFrame) -> None:
     except Exception as e: 
         print(f"Error occured during insert into nhl_data_raw.games.shift_data table: {e}")
 
-if ready:
+kickoff = not get_games(spark, table_name = "nhl_data_raw.games.shift_data").isEmpty()
+if kickoff:
     batch_size = 500
     max_loops = 75
     api_data, missing_games = [], [] 
@@ -353,11 +354,12 @@ if ready:
                         max_429_rate = 0.02
         )
     rows_written_total = 0 
+    shift_schema = spark.sql("select schema_of_json_agg(payload) as json_schema from nhl_data_raw.games.shift_data where http_status = 200 and payload is not null").first()["json_schema"]
     while True: 
         
         if n > max_loops:
             break
-        games = find_games(limit_n = batch_size)
+        games = find_games(limit_n = batch_size, raw_schema = shift_schema)
         if games.isEmpty():
             break 
         buckets = {row["which_game"] for row in games.select("which_game").distinct().collect()}
@@ -393,121 +395,3 @@ if ready:
         if final_pass: 
             break 
     print(f"Done, total rows written = {rows_written_total:,}")
-
-if ready: 
-    
-    run_missing = spark.sql(f"""
-    
-            with current_season_dates as (
-
-                select distinct 
-                    season, 
-                    game_date, 
-                    game_type
-                from nhl_data_staged.games.schedules 
-                where 1 = 1
-                    and game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-                qualify season = max(season) over()
-        )
-        , 
-        current_season_dates_idx as (
-
-            select 
-                a.*, 
-                row_number() over (partition by a.season order by a.game_date) as date_idx 
-            from current_season_dates a
-            
-        )
-
-        select 
-            a.*, 
-            (a.date_idx % 15 = 0)::boolean as run_missing_ind
-        from current_season_dates_idx a
-        order by a.game_date desc 
-        limit 1 
-    
-    """)
-    run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
-    if run_missing_ind: 
-        spark.sql("""
-                
-                with staged as (
-                    
-                    select distinct 
-                        a.season,
-                        a.game_date,
-                        a.game_id,
-                        a.start_time_utc,
-                        from_json(b.payload, 'STRUCT<data: ARRAY<STRING>, total: INT>') as payload_json
-                    from nhl_data_staged.games.schedules a 
-                    left join nhl_data_raw.games.shift_data b 
-                        on a.game_id = b.request_key 
-                    where 1 = 1
-                        and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-                        and a.game_type in (2,3)
-                        and a.season >= 20102011
-
-                )
-                ,
-                src as (
-
-                    select * 
-                    from staged 
-                    where 1 = 1
-                        and payload_json.total = 0 
-                        and size(payload_json.data) = 0 
-                        and (
-                            game_date <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date 
-                            and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(start_time_utc, 'America/Chicago') + interval '15 minutes'
-                            )
-                )
-
-                merge into nhl_data_staged.ops.games_missing_shift t 
-                using src s 
-                    on t.season = s.season
-                    and t.game_id = s.game_id
-
-                when matched and (
-                    
-                    ---using condition check below to ensure that only one retry happens per day
-                    t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-
-                )
-
-                then update set 
-
-                    last_attempt_dte = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
-                    attemp_count = t.attempt_count + 1,
-                    update_dte = current_timestamp()
-                
-                when not matched then insert (
-
-                    season, 
-                    game_id, 
-                    last_attempt_dte,
-                    next_retry_dte,
-                    attemp_count,
-                    insert_dte,
-                    update_dte
-                )
-
-                values (
-
-                    s.season, 
-                    s.game_id, 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
-                    1,
-                    current_timestamp(),
-                    null 
-                )
-                
-                when not matched by source then delete;
-
-        """)
-        print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_shift table")
-    else: 
-        print(f"Skipping insert since current season game date is not eligble")
-else: 
-    print(f"No new data found, skipping insert")
