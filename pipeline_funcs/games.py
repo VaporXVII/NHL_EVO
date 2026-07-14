@@ -1,15 +1,16 @@
 from pyspark.sql import SparkSession, DataFrame 
-def get_games(spark: SparkSession, bronze_table: str) -> DataFrame: 
+from pyspark.errors import AnalysisException
 
-    if "raw" in bronze_table.lower():
+def get_games(spark: SparkSession, table_name: str) -> DataFrame: 
 
+    try: 
         return spark.sql(f"""
                         
                         with cold_start as (
                             ---using as method to make sure script runs on days where games are in play but also for cold start 
                             select 
                                 (count(*) = 0)::boolean as is_cold_start
-                            from {bronze_table.lower()}
+                            from {table_name.lower()}
                         )
                         , 
                         recent_games as (
@@ -41,5 +42,7 @@ def get_games(spark: SparkSession, bronze_table: str) -> DataFrame:
                         limit 1
                         
         """)
-    else: 
-        print("a non-bronze layer table was passed, please correct the bronze_table and argument and try again")
+    except AnalysisException as e:
+        raise ValueError(f"Table '{table_name}' not found. Please check the table name and try again.") from e
+    except Exception as e: 
+        print(f"Error occured: {e}")
