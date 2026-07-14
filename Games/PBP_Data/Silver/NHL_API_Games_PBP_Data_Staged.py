@@ -8,6 +8,7 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo
 from functools import reduce
 import re, json, time, datetime
+from pipeline_funcs.games import get_games
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
 
 spark = SparkSession.builder.getOrCreate()
@@ -38,262 +39,406 @@ def flatten_df(df):
 
     return df
 
-games = spark.sql("""
-                                    
-                    ---pull in all games up until the current date (inclusive)
-                    with date_param as (
+kickoff = not get_games(spark, "nhl_data_staged.games.pbp_data").isEmpty()
+if kickoff: 
+    #section below handles retries for games where there was missing play by play data
+    #the retry logic relies on an index created based on game_date in the schedules table rather than relying on the current_date() function
+    #because we want to retry every 15 days per the NHL schedule 
+    run_missing = spark.sql(f"""
+    
+        with season_param as (
+            
+            ---if table hasn't been populated, use 19001901 for season to indicate a cold start is needed 
+            select 
+                coalesce(max(season), 19001901) as pbp_table_season
+            from nhl_data_staged.games.pbp_data 
+            where 1 = 1
+                and game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
 
-                        select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+        )      
+        ,
+        current_season_dates as (
 
-                    ) 
-                    , 
-                    games as (
+                select /*+ broadcast (p) */ distinct 
+                    a.season, 
+                    a.game_date,
+                    (p.pbp_table_season = 19001901)::boolean as cold_start_ind
+                from nhl_data_staged.games.schedules 
+                cross join season_param p
+                where 1 = 1
+                    and a.game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                qualify a.season = max(a.season) over()
+        )
+        , 
+        current_season_dates_idx as (
 
-                        select /*+ broadcast (p) */ distinct
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc
-                        from nhl_data_staged.games.schedules a
-                        cross join date_param p 
-                        where 1 = 1
-                            and a.game_type in (2, 3)
-                            and a.game_date <= p.current_run_date
+            select 
+                a.*, 
+                row_number() over (partition by a.season order by a.game_date) as date_idx 
+            from current_season_dates a
+            
+        )
 
+        select 
+            a.*, 
+            (a.date_idx % 15 = 0 or cold_start_ind = true)::boolean as run_missing_ind
+        from current_season_dates_idx a
+        order by a.game_date desc 
+        limit 1 
+    
+    """)
+    run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
+    pbp_schema = spark.sql("""
+                           
+                    select schema_of_json_agg(payload) as json_schema 
+                    from nhl_data_raw.games.pbp_data 
+                    where 1 = 1
+                        and payload is not null 
+                        and http_status = 200 
+                           
+    """).first()["json_schema"]
+    if run_missing_ind:
+        
+        spark.sql(f"""
+                  
+                  
+                with staged as (
+                    
+                    select distinct 
+                        a.season, 
+                        a.game_date,
+                        a.game_id,
+                        a.start_time_utc,
+                        from_json(payload, '{pbp_schema}') as payload_json
+                    from nhl_data_staged.games.schedules a  
+                    left join nhl_data_raw.games.pbp_data b 
+                        on a.game_id = b.request_key 
+                    where 1 = 1
+                        ---want to avoid games that are in play today in the vent that the game hasn't started yet or the data feed is slightly delayed
+                        ---to avoid current day games getting added to the games_missing_pbp table
+                        and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and a.game_type in (2,3)
 
-                    )
-                    ,
-                    ---pull in games that have ended today since we want to continue to scrape them to ensure data is as accurate a
-                    ---and as up to date as possible 
-                    games_ended_today as (
+                )
+                , 
+                src as (
+                    
+                    select * 
+                    from staged 
+                    where 1 = 1
+                        and payload_json is not null 
+                        and size(payload_json.plays) = 0 
 
-                        select /*+ broadcast(b), broadcast(p) */ distinct
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            b.start_time_utc
-                        from nhl_data_staged.games.pbp_data a 
-                        inner join games b
-                            on a.season = b.season
-                            and a.game_id = b.game_id
-                            and a.game_date = b.game_date
-                        cross join date_param p
-                        where 1 = 1
-                            and a.game_date = p.current_run_date
-                            and a.event_type = 'game-end'
+                )
+                
+                
+                merge into nhl_data_staged.ops.games_missing_pbp t 
+                using src s 
+                    on t.season = s.season
+                    and t.game_id = s.game_id
 
+                when matched and (
+                    
+                    ---using condition check below to ensure that only one retry happens per day
+                    t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
 
-                    )
-                    ,
-                    ---pull in games that are in play today and where the current timestamp is >= the start time + 15 minutes
-                    ---since NHL games typically don't start for at least 15 minutes after start time
-                    games_in_play as (
+                )
+                then update set 
 
-                        select /*+ broadcast (p) */ distinct
+                    last_attempt_dte = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
+                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    attempt_count = t.attempt_count + 1,
+                    update_dte = current_timestamp()
+
+                when not matched then insert (
+
+                    season, 
+                    game_id, 
+                    last_attempt_dte,
+                    next_retry_dte,
+                    attempt_count,
+                    insert_dte,
+                    update_dte
+
+                )
+                  
+                values (
+
+                    s.season,
+                    s.game_id,
+                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
+                    date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    1,
+                    current_timestamp(),
+                    null
+                )
+                  
+                when not matched by source then delete;
+                  
+        """)
+        print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_pbp table")
+    else: 
+        print(f"Skipping insert since current season game date is not eligble")
+else: 
+    print(f"No new data found, skipping insert")
+
+if kickoff: 
+    games = spark.sql("""
+                                        
+                        ---pull in all games up until the current date (inclusive)
+                        with date_param as (
+
+                            select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+
+                        ) 
+                        , 
+                        games as (
+
+                            select /*+ broadcast (p) */ distinct
                                 a.season,
                                 a.game_id,
                                 a.game_date,
                                 a.start_time_utc
-                        from games a
-                        left anti join games_ended_today b 
-                            on a.season = b.season
+                            from nhl_data_staged.games.schedules a
+                            cross join date_param p 
+                            where 1 = 1
+                                and a.game_type in (2, 3)
+                                and a.game_date <= p.current_run_date
+
+
+                        )
+                        ,
+                        ---pull in games that have ended today since we want to continue to scrape them to ensure data is as accurate a
+                        ---and as up to date as possible 
+                        games_ended_today as (
+
+                            select /*+ broadcast(b), broadcast(p) */ distinct
+                                a.season,
+                                a.game_id,
+                                a.game_date,
+                                b.start_time_utc
+                            from nhl_data_staged.games.pbp_data a 
+                            inner join games b
+                                on a.season = b.season
+                                and a.game_id = b.game_id
+                                and a.game_date = b.game_date
+                            cross join date_param p
+                            where 1 = 1
+                                and a.game_date = p.current_run_date
+                                and a.event_type = 'game-end'
+
+
+                        )
+                        ,
+                        ---pull in games that are in play today and where the current timestamp is >= the start time + 15 minutes
+                        ---since NHL games typically don't start for at least 15 minutes after start time
+                        games_in_play as (
+
+                            select /*+ broadcast (p) */ distinct
+                                    a.season,
+                                    a.game_id,
+                                    a.game_date,
+                                    a.start_time_utc
+                            from games a
+                            left anti join games_ended_today b 
+                                on a.season = b.season
+                                and a.game_id = b.game_id
+                                and a.game_date = b.game_date 
+                            cross join date_param p 
+                            where 1 = 1
+                                and a.game_date = p.current_run_date
+                                and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
+
+                        )
+                        ,
+                        ---pull in games that were played in the prior two days to scrape again and ensure data accuracy 
+                        games_prior_two as (
+
+                            select /*+ broadcast (p) */
+                                a.season,
+                                a.game_id,
+                                a.game_date,
+                                a.start_time_utc
+                            from games a 
+                            cross join date_param p
+                            where 1 = 1
+                                and a.game_date between 
+                                    date_sub(p.current_run_date, 2) 
+                                    and 
+                                    date_sub(p.current_run_date, 1)
+                                
+
+                        )
+                        ,
+                        ---pull in games that have been loaded into the pbp table already 
+                        games_loaded as (
+
+                            select distinct
+                                game_id
+                            from nhl_data_staged.games.pbp_data
+                            where 1 = 1
+                                and game_id is not null
+
+                        )
+                        ,
+                        ---pull in games that have ended and occured before current date
+                        games_ended as (
+
+                            select /*+ broadcast (p) */ distinct
+                                a.game_id
+                            from nhl_data_staged.games.pbp_data a 
+                            cross join date_param p
+                            where 1 = 1
+                                and a.game_id is not null
+                                and a.game_date < p.current_run_date
+                                and a.event_type = 'game-end'
+
+                        )
+                        ,
+                        ---pull in games that didn't have any pbp data in the API
+                        games_missing_from_api as (
+
+                            select 
+                                game_id
+                            from nhl_data_staged.ops.games_missing_pbp
+
+                        )
+                        ,
+                        /* historical games never loaded */
+                        games_not_loaded as (
+
+                            select /*+ broadcast (p) */
+                                a.season,
+                                a.game_id,
+                                a.game_date,
+                                a.start_time_utc
+                            from games a
+                            left anti join games_loaded b
+                                on a.game_id = b.game_id
+                            cross join date_param p 
+                            where 1 = 1
+                                and a.game_date < p.current_run_date
+
+                        )
+                        ,
+                        final_games as (
+
+                            select 
+                                "in play" as which_game,
+                                season, 
+                                game_id, 
+                                game_date, 
+                                start_time_utc
+                            from games_in_play 
+                            union 
+                            select 
+                                "ended today" as which_game,
+                                season, 
+                                game_id, 
+                                game_date, 
+                                start_time_utc
+                            from games_ended_today 
+                            union 
+                            select 
+                                "not loaded" as which_game,
+                                season, 
+                                game_id, 
+                                game_date, 
+                                start_time_utc
+                            from games_not_loaded a 
+                            left anti join games_prior_two b 
+                                on a.game_id = b.game_id 
+                            left anti join games_missing_from_api c 
+                                on a.game_id = c.game_id
+                            union 
+                            select 
+                                "last two" as which_game,
+                                season, 
+                                game_id, 
+                                game_date,
+                                start_time_utc
+                            from games_prior_two
+
+                        )
+
+                        select 
+                            date_format(a.start_time_utc, 'hh:mm a') as game_start_time_cst,
+                            a.*, 
+                            b.request_key,
+                            b.payload
+                        from final_games a 
+                        inner join nhl_data_raw.games.pbp_data b 
+                            on a.game_id = b.request_key
+                        where 1 = 1
+                            and b.http_status = 200
+                            and b.payload is not null 
+                            and b.payload not in ('[]', '{}')
+                        ---using below as a safeguard against dupe rows that may have snuck into raw table since this stream refreshes every 20-30 minutes
+                        ---don't want to use where ingest_ts_utc::date = current_date() since these needs to work with a cold start
+                        qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1    
+                        ;
+                    
+        """)
+    teams = spark.sql("""
+                    
+                    select 
+                        team_id as event_team_id,
+                        team_abbrev as event_team_abbrev
+                    from nhl_data_staged.teams.master_ids    
+
+        """)
+
+    players = spark.sql("""
+                        
+                        select 
+                            player_id, 
+                            player_name, 
+                            player_pos,
+                            shoots_catches, 
+                            team_id, 
+                            team_id_prev_team, 
+                            team_abbrev, 
+                            team_abbrev_prev_team, 
+                            last_active_season
+                        from nhl_data_staged.players.master_ids a 
+                        
+                        
+        """)
+    current_rosters = spark.sql("""
+                                
+                        with date_param as (
+
+                            select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+
+
+                        )
+                            
+                        select /*+ broadcast (p) */ distinct 
+                            a.season, 
+                            a.game_id, 
+                            b.game_date, 
+                            a.player_id, 
+                            a.jersey_num, 
+                            a.team_id, 
+                            a.headshot, 
+                            a.player_name
+                        from nhl_data_staged.players.player_game_rosters a 
+                        inner join nhl_data_staged.games.schedules b 
+                            on a.season = b.season 
                             and a.game_id = b.game_id
-                            and a.game_date = b.game_date 
-                        cross join date_param p 
-                        where 1 = 1
-                            and a.game_date = p.current_run_date
-                            and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
-
-                    )
-                    ,
-                    ---pull in games that were played in the prior two days to scrape again and ensure data accuracy 
-                    games_prior_two as (
-
-                        select /*+ broadcast (p) */
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc
-                        from games a 
+                            and a.game_date = b.game_date
+                            and a.team_id = b.team_id
                         cross join date_param p
                         where 1 = 1
-                            and a.game_date between 
-                                date_sub(p.current_run_date, 2) 
+                            and a.insert_dte::date between 
+                                date_sub(p.current_run_date, 1) 
                                 and 
-                                date_sub(p.current_run_date, 1)
-                            
+                                p.current_run_date
+                                
+                                
+        """)
 
-                    )
-                    ,
-                    ---pull in games that have been loaded into the pbp table already 
-                    games_loaded as (
-
-                        select distinct
-                            game_id
-                        from nhl_data_staged.games.pbp_data
-                        where 1 = 1
-                            and game_id is not null
-
-                    )
-                    ,
-                    ---pull in games that have ended and occured before current date
-                    games_ended as (
-
-                        select /*+ broadcast (p) */ distinct
-                            a.game_id
-                        from nhl_data_staged.games.pbp_data a 
-                        cross join date_param p
-                        where 1 = 1
-                            and a.game_id is not null
-                            and a.game_date < p.current_run_date
-                            and a.event_type = 'game-end'
-
-                    )
-                    ,
-                    ---pull in games that didn't have any pbp data in the API
-                    games_missing_from_api as (
-
-                        select 
-                            game_id
-                        from nhl_data_staged.ops.games_missing_pbp
-
-                    )
-                    ,
-                    /* historical games never loaded */
-                    games_not_loaded as (
-
-                        select /*+ broadcast (p) */
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc
-                        from games a
-                        left anti join games_loaded b
-                            on a.game_id = b.game_id
-                        cross join date_param p 
-                        where 1 = 1
-                            and a.game_date < p.current_run_date
-
-                    )
-                    ,
-                    final_games as (
-
-                        select 
-                            "in play" as which_game,
-                            season, 
-                            game_id, 
-                            game_date, 
-                            start_time_utc
-                        from games_in_play 
-                        union 
-                        select 
-                            "ended today" as which_game,
-                            season, 
-                            game_id, 
-                            game_date, 
-                            start_time_utc
-                        from games_ended_today 
-                        union 
-                        select 
-                            "not loaded" as which_game,
-                            season, 
-                            game_id, 
-                            game_date, 
-                            start_time_utc
-                        from games_not_loaded a 
-                        left anti join games_prior_two b 
-                            on a.game_id = b.game_id 
-                        left anti join games_missing_from_api c 
-                            on a.game_id = c.game_id
-                        union 
-                        select 
-                            "last two" as which_game,
-                            season, 
-                            game_id, 
-                            game_date,
-                            start_time_utc
-                        from games_prior_two
-
-                    )
-
-                    select 
-                        date_format(a.start_time_utc, 'hh:mm a') as game_start_time_cst,
-                        a.*, 
-                        b.request_key,
-                        b.payload
-                    from final_games a 
-                    inner join nhl_data_raw.games.pbp_data b 
-                        on a.game_id = b.request_key
-                    where 1 = 1
-                        and b.http_status = 200
-                        and b.payload is not null 
-                        and b.payload not in ('[]', '{}')
-                    ---using below as a safeguard against dupe rows that may have snuck into raw table since this stream refreshes every 20-30 minutes
-                    ---don't want to use where ingest_ts_utc::date = current_date() since these needs to work with a cold start
-                    qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1    
-                    ;
-                  
-    """)
-teams = spark.sql("""
-                  
-                select 
-                    team_id as event_team_id,
-                    team_abbrev as event_team_abbrev
-                from nhl_data_staged.teams.master_ids    
-
-    """)
-
-players = spark.sql("""
-                     
-                    select 
-                        player_id, 
-                        player_name, 
-                        player_pos,
-                        shoots_catches, 
-                        team_id, 
-                        team_id_prev_team, 
-                        team_abbrev, 
-                        team_abbrev_prev_team, 
-                        last_active_season
-                    from nhl_data_staged.players.master_ids a 
-                     
-                     
-    """)
-current_rosters = spark.sql("""
-                            
-                    with date_param as (
-
-                        select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
-
-
-                    )
-                           
-                    select /*+ broadcast (p) */ distinct 
-                        a.season, 
-                        a.game_id, 
-                        b.game_date, 
-                        a.player_id, 
-                        a.jersey_num, 
-                        a.team_id, 
-                        a.headshot, 
-                        a.player_name
-                    from nhl_data_staged.players.player_game_rosters a 
-                    inner join nhl_data_staged.games.schedules b 
-                        on a.season = b.season 
-                        and a.game_id = b.game_id
-                        and a.game_date = b.game_date
-                        and a.team_id = b.team_id
-                    cross join date_param p
-                    where 1 = 1
-                        and a.insert_dte::date between 
-                            date_sub(p.current_run_date, 1) 
-                            and 
-                            p.current_run_date
-                            
-                            
-    """)
-
-ready = not games.isEmpty()
+    ready = not games.isEmpty()
 
 field_mapping = { 
 

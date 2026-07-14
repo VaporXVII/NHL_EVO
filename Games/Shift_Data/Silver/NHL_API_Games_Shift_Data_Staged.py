@@ -8,289 +8,439 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo 
 from functools import reduce 
 import json, re, datetime
+from pipeline_funcs.games import get_games
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
 
 spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
 
-games = spark.sql("""
-                  
-            with date_param as (
-                ---start with getting current date of script being ran
-                select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+kickoff = not get_games(spark, "nhl_data_staged.games.shift_data").isEmpty()
+if kickoff: 
+    #section below handles retries for games where there was missing shift data
+    #the retry logic relies on an index created based on game_date in the schedules table rather than relying on the current_date() function
+    #because we want to retry every 15 days per the NHL schedule 
+    run_missing = spark.sql(f"""
+    
+        with season_param as (
 
-            )
-            , 
-            pbp_game_status as (
-                ---check to see what the status of the game is based on the play by play data (most reliable method)
-                select
-                    game_id
-                    , max(coalesce(game_in_play, false)) as game_in_play
-                    , coalesce(max(1) filter (where event_type = 'game-end'), 0) as has_game_end
-                from nhl_data_staged.games.pbp_data
-                group by game_id
+            ---if table hasn't been populated, use 19001901 for season to indicate a cold start is needed
+            select 
+                coalesce(max(season), 19001901) as shift_table_season
+            from nhl_data_staged.games.shift_data 
+            where 1 = 1
+                and game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
 
-            )
-            , 
-            games as (
-            ---pull list of all games and various information 
-                select distinct
-                    a.season
-                    , a.game_id
-                    , a.game_date
-                    , a.start_time_utc
-                    , coalesce(b.game_in_play, false) as game_in_play
-                    , coalesce(b.has_game_end, 0) as has_game_end
-                from nhl_data_staged.games.schedules a
-                left join pbp_game_status b
-                    on a.game_id = b.game_id
-                cross join date_param p
-                where 1 = 1
-                    and a.season >= 20102011
-                    and a.game_type in (2,3)
-                    and a.game_date <= p.current_run_date
+        ) 
+        ,
+        current_season_dates as (
 
-            )
-            ,
-            raw_totals as (
-                ---check to see what the total is in the payload that sits in the raw table (which contains data scraped from the API)
-                select 
-                    g.season,
-                    a.request_key,
-                    g.game_date,
-                    g.start_time_utc,
-                    g.game_in_play,
-                    get_json_object(a.payload, "$.total") as total_rows
-                from nhl_data_raw.games.shift_data a 
-                inner join games g 
-                    on a.request_key = g.game_id 
-                
-            )
-            , 
-            quarantined_rows as (
-                ---check to see how many rows were inserted into the quarantined data table for each game
-                select 
-                    a.game_id,
-                    count(*) as total_rows
-                from nhl_data_staged.quarantine.shift_data a 
-                group by 
-                    a.game_id 
-            )
-            ,
-            games_ended_today as (
-                ---check to see which games have ended already that are in play today 
-                ---since the play by play table is populated before the shift table is, we want to make sure that if a game 
-                ---that was in play today has ended before all shift data could be loaded that we continue to load that data 
-                ---(i.e. game ended 15 minutes prior but the remaining shift data for that game hasn't been inserted into staging tables)
-                select 
-                    a.*, 
-                    "ended today" as which_game
-                from games a
-                where 1 = 1
-                    and game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-                    and has_game_end = 1
-            )
-            , 
-            games_missing_from_api as (
-            ---check to see if game doesn't have any shift data found in API (this happens more frequently as shift data API endpoint seems to be somewhat unrealiable)
-                select 
-                    game_id
-                from nhl_data_staged.ops.games_missing_shift
-
-            )
-            , 
-            games_in_play_today as (
-            
-            ---check to see which games are in play today that started at least 15 minutes before the time of the scrape (NHL games always have a lag in start time so don't scrape the API unless the game has truly started)
-                select distinct
-                    a.season
-                    , a.game_id
-                    , a.game_date
-                    , a.start_time_utc
-                    , a.game_in_play
-                    , 'in play' as which_game
-                from games a
-                cross join date_param p
-                where 1 = 1
-                    and a.game_date = p.current_run_date
-                    and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
-                    and a.game_in_play = true
-
-            )
-            , 
-            games_loaded as (
-            ---check totals for games that have already been loaded, this will be used later to compare to make sure that a secondary scrape of that game doesn't need to be done
-                select
-                    game_id,
-                    count(*) as total_rows
-                from nhl_data_staged.games.shift_data
-                where 1 = 1
-                    and game_id is not null
-                    and season >= 20102011
-                group by 
-                    game_id
-            )
-            , 
-            games_not_loaded as (
-            ---check to see which games have not yet been loaded that aren't part of the games that have already been loaded 
-                select
-                    a.season
-                    , a.game_id
-                    , a.game_date
-                    , a.start_time_utc
-                    , a.game_in_play
-                    , 'not loaded' as which_game
-                from games a
-                left anti join games_loaded b
-                    on a.game_id = b.game_id
-                where 1 = 1
-
-            )
-            , 
-            games_prior_two as (
-            ---setting up catch all the continue scraping data for games that have been played in the last 2 days (to ensure data accuracy)
-                select
-                    a.season
-                    , a.game_id
-                    , a.game_date
-                    , a.start_time_utc
-                    , a.game_in_play
-                    , 'last two' as which_game
-                from games a
-                cross join date_param p
-                where 1 = 1
-                    and a.game_date between date_sub(p.current_run_date, 2) and date_sub(p.current_run_date, 1)
-
-            )
-            , 
-            games_partially_loaded as (
-                ---check to see which games were loaded but where the totals in the staging table don't match the total that is listed in the API payload json 
-                select 
+                select /*+ broadcast (p) */ distinct 
                     a.season, 
                     a.game_date,
-                    a.request_key as game_id,
-                    a.start_time_utc,
-                    "partially loaded" as which_game,
-                    a.game_in_play,
-                    a.total_rows as raw_rows, 
-                    coalesce(b.total_rows, 0) as staged_rows, 
-                    coalesce(c.total_rows, 0) as quarantined_rows
-                from raw_totals a
-                left join games_loaded b 
+                    (p.shift_table_season = 19001901) as cold_start_ind
+                from nhl_data_staged.games.schedules a 
+                cross join season_param p 
+                where 1 = 1
+                    and a.game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                qualify a.season = max(a.season) over()
+        )
+        , 
+        current_season_dates_idx as (
+
+            select 
+                a.*, 
+                row_number() over (partition by a.season order by a.game_date) as date_idx 
+            from current_season_dates a
+            
+        )
+
+        select 
+            a.*, 
+            (a.date_idx % 15 = 0 or cold_start_ind = true)::boolean as run_missing_ind
+        from current_season_dates_idx a
+        order by a.game_date desc 
+        limit 1 
+    
+    """)
+    run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
+    shift_schema = spark.sql("""
+                             
+                        select schema_of_json_agg(payload) as json_schema
+                        from nhl_data_raw.games.shift_data 
+                        where 1 = 1
+                            and payload is not null 
+                            and http_status = 200                          
+                            
+    """).first()["json_schema"]
+    if run_missing_ind: 
+
+        spark.sql(f"""
+                
+                with staged as (
+                    
+                    select distinct 
+                        a.season,
+                        a.game_date,
+                        a.game_id,
+                        a.start_time_utc,
+                        from_json(b.payload, '{shift_schema}') as payload_json
+                    from nhl_data_staged.games.schedules a 
+                    left join nhl_data_raw.games.shift_data b 
+                        on a.game_id = b.request_key 
+                    where 1 = 1
+                        ---want to avoid games that are in play today in the vent that the game hasn't started yet or the data feed is slightly delayed
+                        ---to avoid current day games getting added to the games_missing_shift table
+                        ---the shift data endpoint has longer delay than the pbp endpoint does and can be notorious for having data disappear out of nowhere
+                        ---for unknown reasons
+                        and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and a.game_type in (2,3)
+                        and a.season >= 20102011
+
+                )
+                ,
+                src as (
+
+                    select * 
+                    from staged 
+                    where 1 = 1
+                        ----check to see if the payload was empty, in the shift data payload there is a key called total which contains the # of values inside the shift payload
+                        ----if it's 0 then the payload json was empty
+                        and payload_json is not null 
+                        and payload_json.total = 0 
+                        and size(payload_json.data) = 0 
+                        ---ensuring that we aren't looking at games that are being played on the current date 
+                      
+                )
+
+                merge into nhl_data_staged.ops.games_missing_shift t 
+                using src s 
+                    on t.season = s.season
+                    and t.game_id = s.game_id
+
+                when matched and (
+                    
+                    ---using condition check below to ensure that only one retry happens per day
+                    t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+
+                )
+
+                then update set 
+
+                    last_attempt_dte = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
+                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    attempt_count = t.attempt_count + 1,
+                    update_dte = current_timestamp()
+                
+                when not matched then insert (
+
+                    season, 
+                    game_id, 
+                    last_attempt_dte,
+                    next_retry_dte,
+                    attempt_count,
+                    insert_dte,
+                    update_dte
+                )
+
+                values (
+
+                    s.season, 
+                    s.game_id, 
+                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
+                    date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    1,
+                    current_timestamp(),
+                    null 
+                )
+                
+                when not matched by source then delete;
+
+        """)
+        print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_shift table")
+    else: 
+        print(f"Skipping insert since current season game date is not eligble")
+else: 
+    print(f"No new data found, skipping insert")
+
+if kickoff: 
+    games = spark.sql("""
+                    
+                with date_param as (
+                    ---start with getting current date of script being ran
+                    select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+
+                )
+                , 
+                pbp_game_status as (
+                    ---check to see what the status of the game is based on the play by play data (most reliable method)
+                    select
+                        game_id
+                        , max(coalesce(game_in_play, false)) as game_in_play
+                        , coalesce(max(1) filter (where event_type = 'game-end'), 0) as has_game_end
+                    from nhl_data_staged.games.pbp_data
+                    group by game_id
+
+                )
+                , 
+                games as (
+                ---pull list of all games and various information 
+                    select distinct
+                        a.season
+                        , a.game_id
+                        , a.game_date
+                        , a.start_time_utc
+                        , coalesce(b.game_in_play, false) as game_in_play
+                        , coalesce(b.has_game_end, 0) as has_game_end
+                    from nhl_data_staged.games.schedules a
+                    left join pbp_game_status b
+                        on a.game_id = b.game_id
+                    cross join date_param p
+                    where 1 = 1
+                        and a.season >= 20102011
+                        and a.game_type in (2,3)
+                        and a.game_date <= p.current_run_date
+
+                )
+                ,
+                raw_totals as (
+                    ---check to see what the total is in the payload that sits in the raw table (which contains data scraped from the API)
+                    select 
+                        g.season,
+                        a.request_key,
+                        g.game_date,
+                        g.start_time_utc,
+                        g.game_in_play,
+                        get_json_object(a.payload, "$.total") as total_rows
+                    from nhl_data_raw.games.shift_data a 
+                    inner join games g 
+                        on a.request_key = g.game_id 
+                    
+                )
+                , 
+                quarantined_rows as (
+                    ---check to see how many rows were inserted into the quarantined data table for each game
+                    select 
+                        a.game_id,
+                        count(*) as total_rows
+                    from nhl_data_staged.quarantine.shift_data a 
+                    group by 
+                        a.game_id 
+                )
+                ,
+                games_ended_today as (
+                    ---check to see which games have ended already that are in play today 
+                    ---since the play by play table is populated before the shift table is, we want to make sure that if a game 
+                    ---that was in play today has ended before all shift data could be loaded that we continue to load that data 
+                    ---(i.e. game ended 15 minutes prior but the remaining shift data for that game hasn't been inserted into staging tables)
+                    select 
+                        a.*, 
+                        "ended today" as which_game
+                    from games a
+                    where 1 = 1
+                        and game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and has_game_end = 1
+                )
+                , 
+                games_missing_from_api as (
+                ---check to see if game doesn't have any shift data found in API (this happens more frequently as shift data API endpoint seems to be somewhat unrealiable)
+                    select 
+                        game_id
+                    from nhl_data_staged.ops.games_missing_shift
+
+                )
+                , 
+                games_in_play_today as (
+                
+                ---check to see which games are in play today that started at least 15 minutes before the time of the scrape (NHL games always have a lag in start time so don't scrape the API unless the game has truly started)
+                    select distinct
+                        a.season
+                        , a.game_id
+                        , a.game_date
+                        , a.start_time_utc
+                        , a.game_in_play
+                        , 'in play' as which_game
+                    from games a
+                    cross join date_param p
+                    where 1 = 1
+                        and a.game_date = p.current_run_date
+                        and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
+                        and a.game_in_play = true
+
+                )
+                , 
+                games_loaded as (
+                ---check totals for games that have already been loaded, this will be used later to compare to make sure that a secondary scrape of that game doesn't need to be done
+                    select
+                        game_id,
+                        count(*) as total_rows
+                    from nhl_data_staged.games.shift_data
+                    where 1 = 1
+                        and game_id is not null
+                        and season >= 20102011
+                    group by 
+                        game_id
+                )
+                , 
+                games_not_loaded as (
+                ---check to see which games have not yet been loaded that aren't part of the games that have already been loaded 
+                    select
+                        a.season
+                        , a.game_id
+                        , a.game_date
+                        , a.start_time_utc
+                        , a.game_in_play
+                        , 'not loaded' as which_game
+                    from games a
+                    left anti join games_loaded b
+                        on a.game_id = b.game_id
+                    where 1 = 1
+
+                )
+                , 
+                games_prior_two as (
+                ---setting up catch all the continue scraping data for games that have been played in the last 2 days (to ensure data accuracy)
+                    select
+                        a.season
+                        , a.game_id
+                        , a.game_date
+                        , a.start_time_utc
+                        , a.game_in_play
+                        , 'last two' as which_game
+                    from games a
+                    cross join date_param p
+                    where 1 = 1
+                        and a.game_date between date_sub(p.current_run_date, 2) and date_sub(p.current_run_date, 1)
+
+                )
+                , 
+                games_partially_loaded as (
+                    ---check to see which games were loaded but where the totals in the staging table don't match the total that is listed in the API payload json 
+                    select 
+                        a.season, 
+                        a.game_date,
+                        a.request_key as game_id,
+                        a.start_time_utc,
+                        "partially loaded" as which_game,
+                        a.game_in_play,
+                        a.total_rows as raw_rows, 
+                        coalesce(b.total_rows, 0) as staged_rows, 
+                        coalesce(c.total_rows, 0) as quarantined_rows
+                    from raw_totals a
+                    left join games_loaded b 
+                        on a.request_key = b.game_id
+                    left join quarantined_rows c 
+                        on a.request_key = c.game_id 
+
+                )
+                , 
+                final_games as (
+                ---create final list of games that need to be scraped, works during first run of pipeline and then after
+                select 
+                    season,
+                    game_id,
+                    game_date,
+                    start_time_utc,
+                    which_game,
+                    game_in_play
+                from games_partially_loaded a
+                left anti join nhl_data_staged.quarantine.shift_data b 
+                    on a.game_id = b.game_id
+                where 1 = 1
+                    and raw_rows <> (staged_rows + quarantined_rows)
+                union all 
+                select 
+                    season,
+                    game_id,
+                    game_date,
+                    start_time_utc,
+                    which_game,
+                    game_in_play
+                from games_ended_today
+                union 
+                select 
+                    season, 
+                    game_id, 
+                    game_date, 
+                    start_time_utc, 
+                    which_game,
+                    game_in_play
+                from games_in_play_today
+                union
+                select 
+                    season, 
+                    game_id, 
+                    game_date, 
+                    start_time_utc, 
+                    which_game,
+                    game_in_play
+                from games_not_loaded
+                union
+                select 
+                    season, 
+                    game_id, 
+                    game_date, 
+                    start_time_utc, 
+                    which_game,
+                    game_in_play
+                from games_prior_two
+
+                )
+
+                , 
+                final_games_clean as (
+                ---pull out games from final games that don't have data showing in the API, don't need to continue to scrape them 
+                select
+                    a.season
+                    , a.game_id
+                    , a.game_date
+                    , a.start_time_utc
+                    , a.game_in_play
+                    , a.which_game
+                from final_games a
+                left anti join games_missing_from_api b
+                    on a.game_id = b.game_id
+
+                )
+
+                , 
+                raw_data as (
+
+                select
+                    request_key,
+                    payload,
+                    ingest_ts_utc,
+                    from_json(payload, 'struct<data: array<string>, total: int>') as payload_json,
+                    get_json_object(payload, "$.total") as payload_total_rows
+                from nhl_data_raw.games.shift_data a  
+                left anti join quarantined_rows b 
                     on a.request_key = b.game_id
-                left join quarantined_rows c 
-                    on a.request_key = c.game_id 
+                where 1 = 1
+                    and http_status = 200
+                    and substring(request_key, 1, 4)::int >= 2010
 
-            )
-            , 
-            final_games as (
-            ---create final list of games that need to be scraped, works during first run of pipeline and then after
-            select 
-                season,
-                game_id,
-                game_date,
-                start_time_utc,
-                which_game,
-                game_in_play
-            from games_partially_loaded a
-            left anti join nhl_data_staged.quarantine.shift_data b 
-                on a.game_id = b.game_id
-            where 1 = 1
-                and raw_rows <> (staged_rows + quarantined_rows)
-            union all 
-            select 
-                season,
-                game_id,
-                game_date,
-                start_time_utc,
-                which_game,
-                game_in_play
-            from games_ended_today
-            union 
-            select 
-                season, 
-                game_id, 
-                game_date, 
-                start_time_utc, 
-                which_game,
-                game_in_play
-            from games_in_play_today
-            union
-            select 
-                season, 
-                game_id, 
-                game_date, 
-                start_time_utc, 
-                which_game,
-                game_in_play
-            from games_not_loaded
-            union
-            select 
-                season, 
-                game_id, 
-                game_date, 
-                start_time_utc, 
-                which_game,
-                game_in_play
-            from games_prior_two
-
-            )
-
-            , 
-            final_games_clean as (
-            ---pull out games from final games that don't have data showing in the API, don't need to continue to scrape them 
-            select
-                a.season
-                , a.game_id
-                , a.game_date
-                , a.start_time_utc
-                , a.game_in_play
-                , a.which_game
-            from final_games a
-            left anti join games_missing_from_api b
-                on a.game_id = b.game_id
-
-            )
-
-            , 
-            raw_data as (
-
-            select
-                request_key,
-                payload,
-                ingest_ts_utc,
-                from_json(payload, 'struct<data: array<string>, total: int>') as payload_json,
-                get_json_object(payload, "$.total") as payload_total_rows
-            from nhl_data_raw.games.shift_data a  
-            left anti join quarantined_rows b 
-                on a.request_key = b.game_id
-            where 1 = 1
-                and http_status = 200
-                and substring(request_key, 1, 4)::int >= 2010
-
-            )
+                )
 
 
 
-            select
-                date_format(from_utc_timestamp(a.start_time_utc, 'America/Chicago'), 'hh:mm a') as game_start_time_cst
-                , a.*
-                , b.payload
-            from final_games_clean a
-            inner join raw_data b
-                on a.game_id = b.request_key
-            where 1 = 1
-                and b.payload is not null
-                ---and b.payload_json is not null
-                and b.payload_total_rows > 0 
-                ---and b.payload_json.data is not null
-                and size(b.payload_json.data) > 0
-            qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1
-            order by a.game_date desc;
+                select
+                    date_format(from_utc_timestamp(a.start_time_utc, 'America/Chicago'), 'hh:mm a') as game_start_time_cst
+                    , a.*
+                    , b.payload
+                from final_games_clean a
+                inner join raw_data b
+                    on a.game_id = b.request_key
+                where 1 = 1
+                    and b.payload is not null
+                    ---and b.payload_json is not null
+                    and b.payload_total_rows > 0 
+                    ---and b.payload_json.data is not null
+                    and size(b.payload_json.data) > 0
+                qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1
+                order by a.game_date desc;
 
 
-""")
-ready = not games.isEmpty()
+    """)
+    ready = not games.isEmpty()
 
 field_mapping = { 
 
