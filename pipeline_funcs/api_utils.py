@@ -109,9 +109,26 @@ def memory_check(api_data: list, memory_limit_pct: float) -> bool:
     return len(api_data) > 0 and driver_mem_pct() >= memory_limit_pct 
 
 
-def call_api(url: str, rate_limiter: RateLim, endpoint: str, max_attempts: int = 3, time_out: int = 20):
+def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | int | None = None, max_attempts: int = 3, time_out: int = 20):
     
-    game_id = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
+    #req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
+    if request_key is not None:
+        req_key = request_key
+
+    elif endpoint.lower() == "pbp_data":
+        req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
+
+    elif endpoint.lower() == "shift_data":
+        req_key = int(url.split("gameId=")[-1])
+
+    elif endpoint.lower() == "player_search":
+        req_key = url.split('/')[-1]
+    
+    elif endpoint.lower() == "schedule":
+        req_key = url.split('/')[-1]
+
+    else:
+        req_key = url
 
     for attempt in range(max_attempts):
 
@@ -134,7 +151,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, max_attempts: int =
 
                 return {
                     "endpoint": f"{endpoint}",
-                    "request_key": game_id,
+                    "request_key": req_key,
                     "http_status": int(last_status),
                     "payload": json.dumps(payload, ensure_ascii = False),
                     "api_url": url
@@ -146,7 +163,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, max_attempts: int =
 
             return {
                 "endpoint": f"{endpoint}",
-                "request_key": game_id,
+                "request_key": req_key,
                 "http_status": int(last_status),
                 "payload": None,
                 "api_url": url
@@ -160,7 +177,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, max_attempts: int =
     return {
 
         "endpoint": f"{endpoint}",
-        "request_key": game_id,
+        "request_key": req_key,
         "http_status": None,
         "payload": None,
         "api_url": url
@@ -173,7 +190,7 @@ def chunk_list(items, chunk_size):
         yield items[i:i + chunk_size]
 
 
-def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0):
+def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None):
 
     rate_limiter = RateLim(rps = starting_rps)
     results = [] 
@@ -181,7 +198,7 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
     with ThreadPoolExecutor(max_workers = max_workers) as executor:
 
         future_to_url = {
-            executor.submit(call_api, url, rate_limiter, endpoint = endpoint): url
+            executor.submit(call_api, url, rate_limiter, endpoint = endpoint, request_key = None): url
             for url in urls
         }
 
@@ -191,10 +208,27 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
             try:
                 row = future.result()
             except Exception as e:
-                game_id = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
+                #game_id = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
+                if request_key is not None:
+                    req_key = request_key
+
+                elif endpoint.lower() == "pbp_data":
+                    req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
+
+                elif endpoint.lower() == "shift_data":
+                    req_key = int(url.split("gameId=")[-1])
+
+                elif endpoint.lower() == "player_search":
+                    req_key = url.split('/')[-1]
+
+                elif endpoint.lower() == "schedule":
+                    req_key = url.split('/')[-1]
+
+                else:
+                    req_key = url
                 row = {
                     "endpoint": f"{endpoint}",
-                    "request_key": game_id,
+                    "request_key": req_key,
                     "http_status": None,
                     "payload": None,
                     "api_url": url
