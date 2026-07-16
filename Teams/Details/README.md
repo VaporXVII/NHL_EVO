@@ -1,5 +1,5 @@
 # Overview 
-This folder contains the notebooks responsible for processing NHL franchise details data through the Silver and Gold layers of the Medallion Architecture. 
+This folder contains the notebooks responsible for processing NHL franchise details data through the Bronze, Silver, and Gold layers of the Medallion Architecture. 
 The Team Details section also incorporates `nhl_data_staged.teams.master_ids` to include teams that were not Original Six or part of an Expansion era (e.g. Hamilton Tigers, Toronto St. Patrics). The endpoint may include values for `last_active_season` if the franchise is no longer active, hwoever a franchise relocated to a new city 
 and assumed a new team name, then the `nhl_data_staged.games.schedules` table is used to derive the franchise's current team `active_from`, `active_to`, and `last_active_season` fields.
 
