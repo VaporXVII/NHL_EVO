@@ -10,159 +10,218 @@ from zoneinfo import ZoneInfo
 import datetime as dt
 import re
 from pipeline_funcs.schema_utils import convert_case, apply_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
+
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 insert_ready = False
-sched_silver = spark.sql("""
+sched_silver = spark.sql(f"""
                          
             with season_info as (
 
                 select 
                     max(season)::integer as current_season 
                 from nhl_data_staged.games.schedules
+                where 1 = 1
+                    and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(insert_dte, '{user_region}')::date
                 
             )
             ,
             teams_info as (
 
                 select distinct 
-                season,
-                team_id, 
-                team_abbrev,
-                team_name,
-                team_city, 
-                game_date
-            from nhl_data_staged.games.schedules a 
+                    a.season,
+                    a.team_id, 
+                    a.team_abbrev,
+                    a.team_name,
+                    a.team_city, 
+                    a.game_date
+                from nhl_data_staged.games.schedules a
             
             )
 
-            select /*+ broadcast(b) */
-                a.season,
+            select /*+ broadcast(b), broadcast (c) */
+                a.season as game_season,
                 a.team_id,
                 a.team_abbrev,
                 a.team_name,
                 a.team_city,
                 a.game_date,
-                b.current_season
+                b.current_season,
+                c.franchise_id
             from teams_info a 
             cross join season_info b 
+            inner join nhl_data_staged.teams.master_ids c 
+                on a.team_id = c.team_id
                         
     """)
 
 if not sched_silver.isEmpty():
     
     py_source = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get().split("/")[-1]
-    teams = (
-        
-        sched_silver 
-        .select("team_id", "team_abbrev", "team_name", "team_city", "current_season")
-        .dropDuplicates(["team_id"])
+    team_details_raw = spark.sql(f"""
+    
+                    select 
+                        season, 
+                        payload 
+                    from nhl_data_raw.teams.details 
+                    where 1 = 1
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
+    
+    
+    """)
+    team_details_schema = spark.sql("""
 
+                    with most_recent as (
 
-    )
-
-    teams_all = (
-
-        teams 
-        .select("team_id", "team_abbrev", "team_name", "current_season")
-        .dropDuplicates(["team_id"])
-    )
-
-    teams_current = (
-
-                    sched_silver 
-                    .alias("a")
-                    .join(
-
-                            sched_silver 
-                            .select("season")
-                            .agg(f.max("season").alias("max_season"))
-                            .alias("b")
-                    , how = "inner", on = f.col("a.season") == f.col("b.max_season")
+                        select 
+                                payload 
+                            from nhl_data_raw.teams.details
+                        where 1 = 1
+                            and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(ingest_ts_utc, '{user_region}')::date
+                        qualify from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = max(from_utc_timestamp(ingest_ts_utc, '{user_region}')::date) over ()
+                        
                     )
-                    .select("a.team_id")
-                    .withColumn("is_active", f.lit(True).cast(t.BooleanType()))
-                    .dropDuplicates(["team_id"])
 
-    )
+                    select 
+                        schema_of_json_agg(payload) as json_schema 
+                    from nhl_data_raw.teams.details
+                    where 1 = 1
 
-    teams_flagged = (
 
-        teams
-        .alias("t")
-        .join(f.broadcast(teams_current).alias("tc"), how = "left", on = "team_id")
-        .withColumn("is_active", f.coalesce(f.col("tc.is_active"), f.lit(False)))
-        .select("t.*", "is_active")
-    )
-
-    team_active_dates = (
-
-        sched_silver 
-        .groupBy("team_id")
-        .agg(f.min("game_date").alias("active_from"), 
-            f.max("game_date").alias("active_to"))
+    """).first()["json_schema"]
+    base_fields = ["season", "total"]
+    team_details = (
+        
+        team_details_raw 
+        .withColumn("payload_json", f.from_json(f.col("payload"), team_details_schema))
+        .select("season", 
+        
+            f.explode("payload_json.data").alias("data"),
+            f.col("payload_json.total").alias("total")
+        )
+        .select(*base_fields, "data.*")
+        .select(*base_fields, f.col("fullName").alias("team_name"), "firstSeason.*", f.col("id").alias("franchise_id"), "lastSeason")
+        .select(*base_fields, "team_name", "franchise_id", f.col("id").alias("first_season"), "lastSeason.*")
+        .select(*base_fields, "team_name", "franchise_id", "first_season", f.col("id").alias("last_active_season"))
+        
         
     )
+    
+    sched_silver.createOrReplaceTempView("sched_silver_tmp")
+    team_details.createOrReplaceTempView("team_details_tmp")
+    team_details_master = spark.sql(f"""
 
-    teams_final = (
+                with team_bounds as (
 
-        teams_flagged
-        .alias("tf")
-        .join(f.broadcast(team_active_dates).alias("td"), how = "left", on = "team_id")
-        .withColumn("active_from", f.col("td.active_from"))
-        .withColumn("active_to", 
-                    f.when(f.col("tf.is_active") == True, f.lit(None).cast(t.DateType()))
-                    .otherwise(f.col("td.active_to"))
+                        select 
+                            team_id,
+                            team_abbrev,
+                            team_name,
+                            team_city,
+                            ---need franchise ID to join on team_details table 
+                            franchise_id,
+                            min(game_date)::date as active_from,
+                            max(game_date)::date as active_to,
+                            max(game_season)::integer as season_last_game,
+                            max(current_season)::integer as current_season
+                        from sched_silver_tmp 
+                        where 1 = 1
+                        group by 
+                            team_id,
+                            team_abbrev,
+                            team_name,
+                            team_city,
+                            franchise_id
+
                     )
-        .withColumn("py_source", f.lit(py_source))
-        .select(
-            "team_id", 
-            "team_abbrev", 
-            "team_name", 
-            "team_city",
-            "is_active",
-            "active_from", 
-            "active_to",
-            "current_season",
-            "py_source"
-            ) 
-        .withColumn("team_abbrev", f.upper(f.trim(f.col("team_abbrev"))))
-        .withColumn("team_name", f.trim(f.col("team_name")))
-        .withColumn("team_city", f.trim(f.col("team_city")))
-    )
+                    ,
+                    team_details_info as (
 
-    teams_schema = t.StructType([
+                    ---teams that have a record of playing in a game that occurred during or after 2008 season
+                        select 
+                            a.team_id, 
+                            a.team_abbrev, 
+                            a.team_name,
+                            a.team_city,
+                            a.franchise_id,
+                            ---team details NHL API endpoint only returns Original 6 and Expansion teams, but will overwrite teams that have played in one city
+                            ---the moved to another (i.e. Winnipeg Jets overwrite Atlanta Thrashers) therefore the logic below is designed to 
+                            ---determine whether or not a team is truly active
+                            case when b.last_active_season is not null then false 
+                                when extract(year from a.active_to::date)::integer < substring(a.current_season::string, 1, 4)::integer and b.last_active_season is null then false 
+                                else true 
+                                end as is_active,
+                            a.active_from,
+                            a.active_to,
+                            case when extract(year from a.active_to::date)::integer < substring(a.current_season::string, 1, 4)::integer
+                                then concat((extract(year from a.active_to::date)::integer - 1)::string, extract(year from a.active_to::date)::integer)
+                                else a.current_season 
+                                end as last_active_season
+                        from team_bounds a   
+                        left join team_details_tmp b 
+                            on a.franchise_id = b.franchise_id 
+                        union all 
+                        ---teams that are considered historial which have no record of playing in a game after 2008 season (e.g. Quebec Nordiques, Hartford Whalers)
+                        select 
+                            a.team_id,
+                            a.team_abbrev,
+                            a.team_name,
+                            null::string as team_city,
+                            a.franchise_id,
+                            false,
+                            null::date as active_from,
+                            null::date as active_to,
+                            null::integer as last_active_season
+                        from nhl_data_staged.teams.master_ids a 
+                        left anti join team_bounds b 
+                            on a.team_id = b.team_id 
+        
 
-        t.StructField("team_id", t.IntegerType(), False),
-        t.StructField("team_abbrev", t.StringType(), False), 
-        t.StructField("team_name", t.StringType(), False), 
-        t.StructField("team_city", t.StringType(), True),
-        t.StructField("is_active", t.BooleanType(), False), 
-        t.StructField("active_from", t.DateType(), False), 
-        t.StructField("active_to", t.DateType(), True), 
-        t.StructField("current_season", t.IntegerType(), False),
-        t.StructField("py_source", t.StringType(), False)
-    ])
+                    ),
+                    team_details_master as (
 
+                        select 
+                            a.team_id,
+                            a.team_abbrev,
+                            a.team_name,
+                            a.team_city,
+                            a.is_active,
+                            a.active_from,
+                            a.active_to,
+                            case when a.last_active_season is not null then a.last_active_season
+                                when a.is_active = false and b.last_active_season is null then a.last_active_season
+                                else b.last_active_season
+                                end as last_active_season
+                        from team_details_info a 
+                        left join team_details_tmp b 
+                            on a.franchise_id = b.franchise_id 
+                            and b.last_active_season is not null 
+                    )
 
-    teams_final = (
-                    teams_final
-                    .transform(apply_schema, teams_schema)
-                    .filter(
-                            (f.col("team_id") > 0) | 
-                            (f.lower(f.col("team_abbrev")) != "tbd") | 
-                            (f.lower(f.col("team_name")) != "tbd") 
-                            )
-                        )
+                    select 
+                        team_id,
+                        team_abbrev,
+                        team_name,
+                        team_city,
+                        is_active,
+                        active_from,
+                        active_to,
+                        last_active_season,
+                        '{py_source}' as py_source
+                    from team_details_master
 
-    insert_ready = True
+    """)
+    insert_ready = not team_details_master.isEmpty()
 
 if insert_ready: 
     
-    teams_final.createOrReplaceTempView("teams_final_tmp")
+    team_details_master.createOrReplaceTempView("teams_final_tmp")
     spark.sql(f"""
               
               
@@ -174,11 +233,11 @@ if insert_ready:
 
                 t.team_abbrev <> s.team_abbrev
                 or t.team_name <> s.team_name
-                or t.team_city <> s.team_city
+                or coalesce(t.team_city, 'unknown') <> coalesce(s.team_city, 'unknown')
                 or t.is_active <> s.is_active 
-                or t.active_from <> s.active_from 
-                or not (t.active_to <=> s.active_to)
-                or t.current_season <> s.current_season
+                or coalesce(t.active_from, '1900-01-01'::date) <> coalesce(s.active_from, '1900-01-01') 
+                or coalesce(t.active_to, '1900-01-01'::date) <> coalesce(s.active_to, '1900-01-01'::date)
+                or coalesce(t.last_active_season, 0) <> coalesce(s.last_active_season, 0)
                 
             )
 
@@ -188,9 +247,9 @@ if insert_ready:
                 team_name = s.team_name,
                 team_city = s.team_city,
                 active_from = least(t.active_from, s.active_from)::date, 
-                active_to = case when s.is_active then null else s.active_to_end,
+                active_to = s.active_to,
                 is_active = s.is_active,
-                current_season = s.current_season,
+                last_active_season = s.last_active_season,
                 update_dte = current_timestamp(),
                 py_source = s.py_source
 
@@ -204,7 +263,7 @@ if insert_ready:
                 is_active,
                 active_from,
                 active_to,
-                current_season,
+                last_active_season,
                 insert_dte,
                 update_dte,
                 py_source
@@ -220,7 +279,7 @@ if insert_ready:
                 s.is_active,
                 s.active_from,
                 s.active_to,
-                s.current_season,
+                s.last_active_season,
                 current_timestamp(),
                 null,
                 s.py_source
@@ -228,7 +287,11 @@ if insert_ready:
             )
               
     """)
+    spark.catalog.dropTempView("sched_silver_tmp")
+    spark.catalog.dropTempView("team_details_tmp")
     spark.catalog.dropTempView("teams_final_tmp")
     print(f"Teams data successfully loaded into nhl_data_staged.teams.details table")
+    run_table_maint(spark, "nhl_data_staged.teams.details")
+    run_table_maint(spark, "nhl_data.teams.details")
 else: 
   print(f"No new data to insert into nhl_data_staged.teams.details, skipping insert")
