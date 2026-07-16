@@ -692,17 +692,32 @@ cluster by (team_id)
 tblproperties (delta.enableChangeDataFeed = true);
 
 
+create table if not exists nhl_data_raw.teams.details (
+
+    season integer not null,
+    endpoint string not null,
+    http_status integer not null,
+    request_key string,
+    api_url string not null,
+    payload string,
+    ingest_ts_utc timestamp not null
+    
+)
+using delta 
+tblproperties (delta.enableChangeDataFeed = true);
+
+
 create table if not exists nhl_data_staged.teams.details (
 
 
       team_id integer not null, 
       team_abbrev string not null, 
       team_name string not null, 
-      team_city string not null, 
+      team_city string, 
       is_active boolean not null, 
-      active_from date not null,
+      active_from date,
       active_to date, 
-      current_season integer not null,
+      last_active_season integer,
       insert_dte timestamp not null, 
       update_dte timestamp, 
       py_source string not null
