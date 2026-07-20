@@ -8,7 +8,7 @@ from pyspark.sql import DataFrame
 from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo 
 import datetime as dt
-import re
+import re, math
 from pipeline_funcs.schema_utils import convert_case, apply_schema
 from pipeline_funcs.user_utc_region import region_return
 from pipeline_funcs.table_maint import run_table_maint
@@ -35,23 +35,31 @@ sched_silver = spark.sql(f"""
             teams_info as (
 
                 select distinct 
-                    a.season,
                     a.team_id, 
                     a.team_abbrev,
                     a.team_name,
                     a.team_city, 
-                    a.game_date
+                    min(a.pre_season_start_date) as active_from,
+                    max(a.playoff_end_date) active_to,
+                    max(a.season) as last_active_season
                 from nhl_data_staged.games.schedules a
+                group by 
+                    a.team_id,
+                    a.team_abbrev,
+                    a.team_name,
+                    a.team_city
+            
             
             )
 
             select /*+ broadcast(b), broadcast (c) */
-                a.season as game_season,
                 a.team_id,
                 a.team_abbrev,
                 a.team_name,
                 a.team_city,
-                a.game_date,
+                a.active_from,
+                a.active_to,
+                a.last_active_season,
                 b.current_season,
                 c.franchise_id
             from teams_info a 
@@ -71,7 +79,8 @@ if not sched_silver.isEmpty():
                         payload 
                     from nhl_data_raw.teams.details 
                     where 1 = 1
-                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                    qualify from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = max(from_utc_timestamp(ingest_ts_utc, '{user_region}')::date) over () 
     
     
     """)
@@ -80,8 +89,8 @@ if not sched_silver.isEmpty():
                     with most_recent as (
 
                         select 
-                                payload 
-                            from nhl_data_raw.teams.details
+                            payload 
+                        from nhl_data_raw.teams.details
                         where 1 = 1
                             and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(ingest_ts_utc, '{user_region}')::date
                         qualify from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = max(from_utc_timestamp(ingest_ts_utc, '{user_region}')::date) over ()
@@ -120,24 +129,10 @@ if not sched_silver.isEmpty():
                 with team_bounds as (
 
                         select 
-                            team_id,
-                            team_abbrev,
-                            team_name,
-                            team_city,
+                            a.*
                             ---need franchise ID to join on team_details table 
-                            franchise_id,
-                            min(game_date)::date as active_from,
-                            max(game_date)::date as active_to,
-                            max(game_season)::integer as season_last_game,
-                            max(current_season)::integer as current_season
-                        from sched_silver_tmp 
+                        from sched_silver_tmp a
                         where 1 = 1
-                        group by 
-                            team_id,
-                            team_abbrev,
-                            team_name,
-                            team_city,
-                            franchise_id
 
                     )
                     ,
@@ -233,11 +228,11 @@ if insert_ready:
 
                 t.team_abbrev <> s.team_abbrev
                 or t.team_name <> s.team_name
-                or coalesce(t.team_city, 'unknown') <> coalesce(s.team_city, 'unknown')
+                or coalesce(t.team_city, '__NULL__') <> coalesce(s.team_city, t.team_city, '__NULL__')
                 or t.is_active <> s.is_active 
-                or coalesce(t.active_from, '1900-01-01'::date) <> coalesce(s.active_from, '1900-01-01') 
-                or coalesce(t.active_to, '1900-01-01'::date) <> coalesce(s.active_to, '1900-01-01'::date)
-                or coalesce(t.last_active_season, 0) <> coalesce(s.last_active_season, 0)
+                or coalesce(t.active_from, '1900-01-01'::date) <> coalesce(s.active_from, t.active_from, '1900-01-01'::date)
+                or coalesce(t.active_to, '1900-01-01'::date) <> coalesce(s.active_to, t.active_to, '1900-01-01'::date)
+                or coalesce(t.last_active_season, 0) <> coalesce(s.last_active_season, t.last_active_season, 0)
                 
             )
 
@@ -246,7 +241,7 @@ if insert_ready:
                 team_abbrev = s.team_abbrev,
                 team_name = s.team_name,
                 team_city = s.team_city,
-                active_from = least(t.active_from, s.active_from)::date, 
+                active_from = s.active_from, 
                 active_to = s.active_to,
                 is_active = s.is_active,
                 last_active_season = s.last_active_season,

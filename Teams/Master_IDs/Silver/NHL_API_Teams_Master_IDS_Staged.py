@@ -8,17 +8,30 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo
 import datetime as dt, re, requests, json
 from pipeline_funcs.schema_utils import convert_case, apply_schema, build_fields, get_schema
+from pipeline_funcs.user_utc_region import region_return 
+from pipeline_funcs.table_maint import run_table_maint
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
-season_check_df = spark.sql("""
+season_check_df = spark.sql(f"""
                             
                             
                 select 
-                    (select max(season) from nhl_data_staged.games.schedules)::integer as sched_current_season,
-                    (select coalesce(max(season), 19001901) from nhl_data_staged.teams.master_ids)::integer as team_ids_season,
+                    (
+                    select 
+                        max(season) 
+                    from nhl_data_staged.games.schedules 
+                    where 1 = 1
+                        and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(insert_dte, '{user_region}')::date
+                    )::integer as sched_current_season,
+                    (
+                    select 
+                        coalesce(max(season), 19001901) 
+                    from nhl_data_staged.teams.master_ids
+                    )::integer as team_ids_season,
                     not (sched_current_season = team_ids_season)::boolean as new_season_started_ind
                             
     """)
@@ -117,7 +130,7 @@ if insert_ready:
               when matched and (
 
                 t.season <> s.season 
-                coalesce(t.franchise_id, 'unknown') <> coalesce(s.franchise_id, 'unknown') 
+                or coalesce(t.franchise_id, 999) <> coalesce(s.franchise_id, 999) 
                 or t.team_name <> s.team_name
                 or t.league_id <> s.league_id
                 or t.team_abbrev <> s.team_abbrev
@@ -163,5 +176,8 @@ if insert_ready:
     """)
     spark.catalog.dropTempView("team_master_ids_tmp")
     print(f"Schedules data successfully loaded into nhl_data_staged.teams.master_ids table")
+    run_table_maint(spark, "nhl_data_staged.teams.master_ids")
+    run_table_maint(spark, "nhl_data.teams.master_ids")
+
 else:   
     print(f"No new data to insert into nhl_data_staged.teams.master_ids, skipping insert")

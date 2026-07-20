@@ -8,11 +8,13 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo 
 import datetime, re
 from pipeline_funcs.schema_utils import convert_case, apply_schema, get_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
-
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 def wrangle_data(df: DataFrame, pos: str) -> DataFrame:
 
@@ -106,7 +108,7 @@ players_master = spark.sql("""
 
     """)
 
-pgr_raw = spark.sql("""
+pgr_raw = spark.sql(f"""
                     
                     select 
                         request_key,
@@ -117,18 +119,18 @@ pgr_raw = spark.sql("""
                     where 1 = 1
                         and payload is not null 
                         and payload not in ('[]', '{}')
-                        and ingest_ts_utc::date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and ingest_ts_utc::date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
                     --qualify ingest_ts_utc = max(ingest_ts_utc) over ()
                         
                     
     """)
 
-game_tracker = spark.sql("""
+game_tracker = spark.sql(f"""
                          
                     with date_param as (
 
 
-                        select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                        select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
 
                     ) 
                     ,
@@ -164,7 +166,7 @@ game_tracker = spark.sql("""
         
     """)
 
-pbp_prior_games = spark.sql("""
+pbp_prior_games = spark.sql(f"""
                             
                         ---logic below is used to pull player ids from the pbp data for all games including the previous day to check 
                         ---if there were any players that may have been missed by current rosters staged logic or weren't the rosters source that 
@@ -202,7 +204,7 @@ pbp_prior_games = spark.sql("""
                                 and a.game_date = c.game_date 
                                 and b.player_id = c.player_id
                             where 1 = 1
-                                and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                                and a.game_date < from_utc_timestamp(current_timestamp(), '{user_region}')::date
                                 and a.event_team_id is not null
                                 and a.event_type not in ('period-start', 'period-end', 'stoppage', 'game-start', 'game-end')
                                 and b.player_id is not null 
@@ -243,7 +245,7 @@ pbp_prior_games = spark.sql("""
                                 and a.game_date = c.game_date 
                                 and b.player_id = c.player_id
                             where 1 = 1
-                                and a.game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date 
+                                and a.game_date = from_utc_timestamp(current_timestamp(), '{user_region}')::date 
                                 and a.event_team_id is not null
                                 and a.event_type not in ('period-start', 'period-end', 'stoppage', 'game-start', 'game-end')
                                 and b.player_id is not null 
@@ -410,7 +412,7 @@ if ready:
 if insert_ready: 
 
     master_pgr_merged.createOrReplaceTempView("player_game_rosters_tmp")
-    spark.sql("""
+    spark.sql(f"""
               
         with src as (
 
@@ -432,9 +434,9 @@ if insert_ready:
             and t.game_date = s.game_date
             and t.player_id = s.player_id
             and t.game_date between 
-                date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                 and 
-                from_utc_timestamp(current_timestamp(), 'America/Chicago')::date 
+                from_utc_timestamp(current_timestamp(), '{user_region}')::date 
             
 
         when matched and (
@@ -519,9 +521,8 @@ if insert_ready:
 else: 
     print(f"No new data to insert into nhl_data_staged.players.player_game_rosters table.")
 if datetime.datetime.today().day % 5 == 0:
-    spark.sql("""analyze table nhl_data_staged.players.player_game_rosters compute statistics;""")
-    spark.sql("""optimize nhl_data_staged.players.player_game_rosters;""")
-    spark.sql("""vacuum nhl_data_staged.players.player_game_rosters;""")
+    run_table_maint(spark, "nhl_data_staged.players.player_game_rosters")
+    run_table_maint(spark, "nhl_data.players.player_game_rosters")
 
 if insert_ready: 
 
@@ -535,7 +536,7 @@ if insert_ready:
             from nhl_data_staged.games.schedules 
             where 1 = 1
                 and game_type in (2,3)
-                and from_utc_timestamp(current_timestamp(), 'America/Chicago')::date >= game_date
+                and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= game_date
 
             )
             , 

@@ -1,3 +1,7 @@
+import sys 
+username = spark.sql("select current_user()").first()[0]
+sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
 from zoneinfo import ZoneInfo 
@@ -5,10 +9,13 @@ from delta.tables import DeltaTable
 import requests, json, time, random, threading, datetime as dt
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor 
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint 
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 _rate_lock = threading.Lock()
 next_allowed = 0.0 
@@ -79,7 +86,7 @@ def call_api(url:str, rps:float = 2.0, max_attempts: int = 3, time_out:int = 20)
            
     return None
 
-todays_teams = spark.sql("""
+todays_teams = spark.sql(f"""
                         
                         select /*+ broadcast (b) */ distinct 
                             a.game_id, 
@@ -91,7 +98,7 @@ todays_teams = spark.sql("""
                         left anti join nhl_data_staged.players.player_game_rosters c 
                             on a.game_id = c.game_id
                         where 1 = 1
-                            and a.game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                            and a.game_date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
                             and b.is_active = true
                             and a.game_type in (2,3)
                         
@@ -140,17 +147,17 @@ if ready:
 if insert_ready: 
 
     pgr_df.createOrReplaceTempView("pgr_df_tmp")
-    spark.sql("""
+    spark.sql(f"""
               
               
         merge into nhl_data_raw.players.player_game_rosters t  
         using pgr_df_tmp s 
             on t.team_id = s.team_id 
             and t.game_id = s.game_id           
-            and from_utc_timestamp(t.ingest_ts_utc, 'America/Chicago')::date between 
-                date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+            and from_utc_timestamp(t.ingest_ts_utc, '{user_region}')::date between 
+                date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                 and 
-                from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                from_utc_timestamp(current_timestamp(), '{user_region}')::date
         
         when matched and (
 
@@ -158,7 +165,7 @@ if insert_ready:
             or (
                 not (t.payload <=> s.payload)
                 and s.payload is not null 
-                and s.payload not in ("[]", "{}")
+                and s.payload not in ("[]", "{{}}")
                 and s.http_status = 200
             )
         )
@@ -198,5 +205,7 @@ if insert_ready:
     """)
     spark.catalog.dropTempView("pgr_df_tmp")
     print(f"Player ids data successfully loaded into nhl_data_raw.players.player_game_rosters table")
+    if dt.datetime.today().day % 5 == 0:
+        run_table_maint(spark, "nhl_data_raw.players.player_game_rosters")
 else:
     print("No new data to load into nhl_data_raw.players.player_game_rosters table")

@@ -8,15 +8,19 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo 
 import datetime, re
 from pipeline_funcs.schema_utils import convert_case, apply_schema, unpack_data
+from pipeline_funcs.user_utc_region import region_return 
+from pipeline_funcs.table_maint import run_table_maint
 
+
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
-spec_teams_raw = spark.sql(r"""
+spec_teams_raw = spark.sql(fr"""
                            
                          with date_param as (
 
-                              select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date 
+                              select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date 
                          )
                          , 
                          raw_array as (
@@ -34,9 +38,9 @@ spec_teams_raw = spark.sql(r"""
                                    and endpoint not ilike '%time%'
                                    and http_status = 200
                                    and payload is not null 
-                                   and payload not in ('[]', '{}')
+                                   and payload not in ('[]', '{{}}')
                                    and get_json_object(payload, "$.total")::integer > 0
-                                   and from_utc_timestamp(ingest_ts_utc, 'America/Chicago')::date between date_sub(current_run_date, 2) and current_run_date
+                                   and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_date, 2) and current_run_date
 
                          )
                          , 
@@ -92,12 +96,12 @@ if not spec_teams_raw.isEmpty():
 
 if insert_ready: 
     spec_teams.createOrReplaceTempView("pk_stats_staged_tmp")
-    spark.sql("""
+    spark.sql(f"""
               
             with params as (
 
 
-                select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
 
             )
             , 
@@ -125,10 +129,10 @@ if insert_ready:
                 and (
                     t.game_date between
                         date_sub(
-                            from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
+                            from_utc_timestamp(current_timestamp(), '{user_region}')::date,
                             2
                         )
-                        and from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 )
             
             when matched and (
@@ -238,4 +242,4 @@ if insert_ready:
 else: 
     print(f"No new data to insert into nhl_data_staged.games.pk_stats, skipping insert")
 if datetime.datetime.today().day % 5 == 0:
-    spark.sql("analyze table nhl_data_staged.games.pk_stats compute statistics;")
+    run_table_maint(spark, "nhl_data_staged.games.pk_stats")

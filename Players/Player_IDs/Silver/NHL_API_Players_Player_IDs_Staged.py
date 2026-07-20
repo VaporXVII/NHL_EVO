@@ -5,22 +5,16 @@ sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, window as w, DataFrame
 from delta.tables import DeltaTable
-
 from zoneinfo import ZoneInfo 
 import datetime, re
 from pipeline_funcs.schema_utils import convert_case, apply_schema, build_fields, get_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
-
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
-
-def now_central():
-    return datetime.datetime.now(central_timezone)
-
-def today_central():
-    return now_central().date()
-today = today_central()
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 def mget(map_col, keys_):
     
@@ -128,7 +122,7 @@ field_mapping = {
 keep_fields = ['player_id', 'player_name', 'player_pos', 'player_pos_cat', 'team_id', 'team_abbrev', 'team_id_prev_team', 'team_abbrev_prev_team', 'last_active_season', 'jersey_num', 'shoots_catches', 'is_active']
 payload_type = t.ArrayType(t.MapType(t.StringType(), t.StringType()))
 
-players_raw = spark.sql("""
+players_raw = spark.sql(f"""
                         
                         select 
                             request_key,
@@ -136,14 +130,14 @@ players_raw = spark.sql("""
                             ingest_ts_utc
                         from nhl_data_raw.players.player_search
                         where 1 = 1
-                            and from_utc_timestamp(ingest_ts_utc, 'America/Chicago')::date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
                             and payload is not null 
-                            and payload not in ('[]', '{}')
+                            and payload not in ('[]', '{{}}')
                             and size(from_json(payload, 'data ARRAY<STRING>').data) > 0
-                                        
+                        qualify row_number() over (partition by request_key order by ingest_ts_utc desc) = 1
     """)
                         
-skaters_raw = spark.sql("""
+skaters_raw = spark.sql(f"""
                         
                         select 
                             request_key,
@@ -151,15 +145,16 @@ skaters_raw = spark.sql("""
                             ingest_ts_utc
                         from nhl_data_raw.players.player_search_season 
                         where 1 = 1 
+                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
                             and endpoint = 'skater_summary'
                             and payload is not null 
-                            and payload not in ('[]', '{}')    
+                            and payload not in ('[]', '{{}}')    
                             and size(from_json(payload, 'data ARRAY<STRING>').data) > 0 
                         qualify row_number() over (partition by endpoint, request_key order by ingest_ts_utc desc) = 1
 
     """)
                         
-goalies_raw = spark.sql("""
+goalies_raw = spark.sql(f"""
                         
                         select 
                             request_key, 
@@ -167,9 +162,10 @@ goalies_raw = spark.sql("""
                             ingest_ts_utc
                         from nhl_data_raw.players.player_search_season 
                         where 1 = 1
+                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
                             and endpoint = 'goalie_summary'
                             and payload is not null 
-                            and payload not in ('[]', '{}')
+                            and payload not in ('[]', '{{}}')
                             and size(from_json(payload, 'data ARRAY<STRING>').data) > 0
                         qualify row_number() over (partition by endpoint, request_key order by ingest_ts_utc desc) = 1
 
@@ -320,189 +316,103 @@ if insert_ready:
     players_silver.createOrReplaceTempView("players_tmp")
     spark.sql(f"""
                 
-            with latest_season as (
-                ---check to see if there's any records in the staged.master_ids table
-                ---if yes, grab latest last_active_season, otherwise use placeholder 
-                select 
-                    coalesce(max(last_active_season), 19001901) as latest_season_id
-                from nhl_data_staged.players.master_ids 
-            )
-            ,
-            loading_table as (
-
-                ---players can come through as having team_id/prev_team_id being null, flipping to values of 0 which can never be used 
-                ---in order to make comparisons later in sequence below easier to track
-                select 
-                    player_id, 
-                    player_name, 
-                    player_pos,
-                    coalesce(team_id, 0) as team_id, 
-                    team_abbrev, 
-                    coalesce(team_id_prev_team, 0) as team_id_prev_team, 
-                    team_abbrev_prev_team, 
-                    coalesce(last_active_season, 19001901) as last_active_season,
-                    jersey_num,
-                    shoots_catches,
-                    is_active,
-                    required_field_empty_rate
-                from players_tmp 
-                where 1 = 1
-            )
-            ,
-            master as (
-
-                ---grab the players from staged.master_ids table that are in the table coming through the scrape
-                select 
-                    player_id, 
-                    player_name, 
-                    team_id, 
-                    team_abbrev, 
-                    team_id_prev_team, 
-                    team_abbrev_prev_team, 
-                    last_active_season
-                from nhl_data_staged.players.master_ids a   
-                left semi join loading_table b 
-                    on a.player_id = b.player_id
-
-            )
-            , 
-            staged as (
+            with player_data as (
 
                 select 
-                    a.player_id, 
-                    a.player_name, 
+                    a.player_id,
+                    a.player_name,
                     a.player_pos,
-                    a.team_id,
-                    a.team_abbrev,
-                    
-                    case when 
-                        (a.last_active_season = c.latest_season_id 
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id = b.team_id and a.team_id_prev_team = b.team_id)
-                            
-                        ) then b.team_id_prev_team
-                        when 
-                        (a.last_active_season = c.latest_season_id 
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id = b.team_id) 
-                        ) then b.team_id
-                        when 
-                        (a.last_active_season = c.latest_season_id 
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id <> b.team_id)
-                        
-                        ) then b.team_id
-                        when 
-                        (
-                        a.last_active_season = c.latest_season_id
-                            and 
-                        (a.team_id_prev_team is null and b.team_id_prev_team is null)
-
-                        ) then null 
-                        when 
-                        (
-                        a.last_active_season <> c.latest_season_id 
-                            and 
-                        (a.team_id <> a.team_id_prev_team)
-
-                        ) then a.team_id_prev_team
-                        else b.team_id_prev_team
-                        end as team_id_prev_team,
-                    case when 
-                        (a.last_active_season = c.latest_season_id
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id = b.team_id and a.team_id_prev_team = b.team_id)
-
-                        ) then b.team_abbrev_prev_team 
-                        when 
-                        (a.last_active_season = c.latest_season_id 
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id = b.team_id)
-
-                        ) then b.team_abbrev
-                        when 
-                        (a.last_active_season = c.latest_season_id
-                            and 
-                        (a.team_id = a.team_id_prev_team and a.team_id <> b.team_id)
-
-                        ) then b.team_abbrev
-                        when 
-                        ( 
-                        a.last_active_season = c.latest_season_id 
-                            and 
-                        (a.team_id_prev_team is null and b.team_id_prev_team is null)
-
-                        ) then null 
-                        when 
-                        (
-                        a.last_active_season <> c.latest_season_id
-                            and 
-                        (a.team_id <> a.team_id_prev_team)
-
-                        ) then a.team_abbrev_prev_team
-                        else b.team_abbrev_prev_team 
-                        end as team_abbrev_prev_team,
+                    coalesce(a.team_id, b.team_id) as team_id,
+                    coalesce(a.team_abbrev, b.team_abbrev) as team_abbrev,
+                    a.team_id_prev_team,
+                    a.team_abbrev_prev_team,
                     a.last_active_season,
                     a.jersey_num,
                     a.shoots_catches,
                     a.is_active,
                     a.required_field_empty_rate
-                from loading_table a  
-                left join master b   
+                from players_tmp a   
+                left join nhl_data_staged.players.master_ids b  
                     on a.player_id = b.player_id 
-                cross join latest_season c 
-                where 1 = 1
-                   
+
             )
             , 
             src as (
 
                 select 
-                    a.player_id, 
-                    a.player_name, 
-                    a.player_pos, 
-                    nullif(a.team_id, 0) as team_id,
-                    a.team_abbrev,
-                    nullif(a.team_id_prev_team, 0) as team_id_prev_team,
-                    a.team_abbrev_prev_team,
-                    nullif(a.last_active_season, 19001901) as last_active_season,
-                    a.jersey_num,
-                    a.shoots_catches,
-                    a.is_active,
-                    a.required_field_empty_rate
-                from staged a
-                where 1 = 1
+                    player_id, 
+                    player_name, 
+                    player_pos, 
+                    team_id, 
+                    team_abbrev,
+                    case when team_id = team_id_prev_team then null
+                        when is_active = false then coalesce(team_id, team_id_prev_team)
+                        else team_id_prev_team 
+                        end as team_id_prev_team,
+                    case when team_id = team_id_prev_team then null
+                        when is_active = false then coalesce(team_abbrev, team_abbrev_prev_team)
+                        else team_abbrev_prev_team
+                        end as team_abbrev_prev_team,
+                    last_active_season,
+                    jersey_num,
+                    shoots_catches,
+                    is_active,
+                    required_field_empty_rate
+                from player_data 
 
             )
-
+        
             merge into nhl_data_staged.players.master_ids t 
             using src s 
                 on t.player_id = s.player_id
 
             when matched and (
 
-                not (t.player_name <=> s.player_name)
-                or not (t.team_id <=> s.team_id)
-                or not (t.team_id_prev_team <=> s.team_id_prev_team)
-                or not (t.last_active_season <=> s.last_active_season)
+                not (t.player_name <=> coalesce(s.player_name, t.player_name))
+                or not (t.team_id <=> coalesce(s.team_id, t.team_id))
                 or not (t.jersey_num <=> s.jersey_num) 
-                or not (t.player_pos <=> s.player_pos)
-                or t.is_active <> s.is_active 
-                or t.required_field_empty_rate <> s.required_field_empty_rate
+                or not (t.shoots_catches <=> s.shoots_catches)
+                or not (t.player_pos <=> coalesce(s.player_pos, t.player_pos))
+                or coalesce(t.is_active, false) <> coalesce(s.is_active, false)
 
             )
                     
             then update set 
 
-                player_name = s.player_name,
-                team_id = s.team_id,
-                team_abbrev = s.team_abbrev,
-                team_id_prev_team = s.team_id_prev_team,
-                team_abbrev_prev_team = s.team_abbrev_prev_team,
-                last_active_season = s.last_active_season,
-                jersey_num = s.jersey_num,
-                player_pos = s.player_pos,
-                is_active = s.is_active,
+                player_name = coalesce(s.player_name, t.player_name),
+                team_id = coalesce(s.team_id, t.team_id),
+                team_abbrev = coalesce(s.team_abbrev, t.team_abbrev),
+                ---purpose is to move the target team_id to the team_id_prev_team spot if the player has moved to a new team
+                team_id_prev_team = case 
+                                        ---if the target source team_id is the same as the target team_id and team_id_prev_team then set to null  
+                                        when coalesce(t.team_id, s.team_id) = s.team_id and t.team_id_prev_team = s.team_id then null 
+                                        ---if the target team_id is null then use the first non-null of target/source team_id_prev_team
+                                        when t.team_id is null then coalesce(t.team_id_prev_team, s.team_id_prev_team) 
+                                        ---if the target team_id is not equal to the source team_id then move the target team_id to the target team_id_prev_team spot
+                                        when not (t.team_id <=> coalesce(s.team_id, t.team_id)) then t.team_id
+                                        ---if the target team_id_prev_team is null then leave it null 
+                                        when t.team_id_prev_team is null then null
+                                        ---if the target team id equals source team_id then use the target team_id_prev_team 
+                                        when t.team_id <=> coalesce(s.team_id, t.team_id) then t.team_id_prev_team
+                                        else t.team_id 
+                                        end, 
+                team_abbrev_prev_team = case 
+                                        when coalesce(t.team_id, s.team_id) = s.team_id and t.team_id_prev_team = s.team_id then null 
+                                        when t.team_id is null then coalesce(t.team_abbrev_prev_team, s.team_abbrev_prev_team)
+                                        when not (t.team_id <=> coalesce(s.team_id, t.team_id)) then t.team_abbrev
+                                        when t.team_id_prev_team is null then null
+                                        when t.team_id <=> coalesce(s.team_id, t.team_id) then t.team_abbrev_prev_team
+                                        else t.team_abbrev
+                                        end, 
+                last_active_season = case when t.last_active_season is null and s.last_active_season is null then null 
+                                        else greatest(
+                                                coalesce(s.last_active_season, 19001901),
+                                                coalesce(t.last_active_season, 19001901)
+                                                )
+                                        end,
+                jersey_num = coalesce(s.jersey_num, t.jersey_num),
+                player_pos = coalesce(s.player_pos, t.player_pos),
+                is_active = coalesce(s.is_active, t.is_active),
                 update_dte = current_timestamp(),
                 required_field_empty_rate = s.required_field_empty_rate,
                 py_source = '{py_source}',
@@ -511,13 +421,11 @@ if insert_ready:
                                                 ', '
                                                 , filter(
                                                     array(
-                                                            case when not (t.player_name <=> s.player_name) then 'player_name' end,
-                                                            case when not (t.team_id <=> s.team_id) then 'team_id' end,
-                                                            case when not (t.team_id_prev_team <=> s.team_id_prev_team) then 'team_id_prev_team' end,
-                                                            case when not (t.last_active_season <=> s.last_active_season) then 'last_active_season' end,
+                                                            case when not (t.player_name <=> coalesce(s.player_name, t.player_name)) then 'player_name' end,
+                                                            case when not (t.team_id <=> coalesce(s.team_id, t.team_id)) then 'team_id' end,
                                                             case when not (t.jersey_num <=> s.jersey_num) then 'jersey_num' end,
                                                             case when not (t.player_pos <=> s.player_pos) then 'player_pos' end,
-                                                            case when t.is_active <> s.is_active then 'is_active' end,
+                                                            case when coalesce(t.is_active, false) <> coalesce(s.is_active, false) then 'is_active' end,
                                                             case when t.required_field_empty_rate <> s.required_field_empty_rate then 'required_field_empty_rate' end
                                                     )
                                                     , x -> x is not null
@@ -571,8 +479,7 @@ if insert_ready:
     """)
     spark.catalog.dropTempView("players_tmp")
     print("Player ids successfully loaded into nhl_data_staged.players.master_ids table")
+    run_table_maint(spark, "nhl_data_staged.players.master_ids")
+    run_table_maint(spark, "nhl_data.players.master_ids")
 else: 
     print("No new batch of player ids found, skipping insert")
-if datetime.datetime.today().day % 5 == 0:
-    spark.sql("analyze table nhl_data_staged.players.master_ids compute statistics;")
-    spark.sql("optimize nhl_data_staged.players.master_ids;")

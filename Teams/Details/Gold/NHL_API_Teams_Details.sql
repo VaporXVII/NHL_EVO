@@ -5,9 +5,10 @@ with season_info as (
     max(season) as latest_season 
   from nhl_data_staged.games.schedules 
 
+
 )
 ,
-source_data as (
+src as (
 
 ---joining the latest season from above with the source table to be able to tell the merge to execute only if they don't match (i.e. a new season has rolled over)
   select /*+ broadcast (b) */
@@ -19,20 +20,15 @@ source_data as (
 )
 
 merge into nhl_data.teams.details t 
-using source_data s 
+using src s 
   on t.team_id = s.team_id
-when matched and 
-
-  ---if the current season from the team.details staging table doesn't match the latest season from the schedules table then do the update because a new season has rolled over 
-  ---otherwise insert the data (assumes that user has not yet run the pipeline at all)
-  s.current_season <> s.latest_season
-  and (
+when matched and (
 
   t.team_abbrev <> s.team_abbrev
   or t.team_name <> s.team_name
   or t.is_active <> s.is_active
-  or t.active_from <> s.active_from 
-  or not (t.active_to <=> s.active_to)
+  or coalesce(t.active_from, '1900-01-01'::date) <> coalesce(s.active_from, t.active_from, '1900-01-01'::date)
+  or coalesce(t.active_to, '1900-01-01'::date) <> coalesce(s.active_to, t.active_to, '1900-01-01'::date)
   
 
 ) 
@@ -55,7 +51,9 @@ then update set
     active_to, 
     insert_dte, 
     update_dte
+
   )
+
   values (
 
     s.team_id, 

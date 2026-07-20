@@ -1,3 +1,7 @@
+import sys 
+username = spark.sql("select current_user()").first()[0]
+sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
 from delta.tables import DeltaTable
@@ -6,9 +10,11 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import requests, certifi, json, time, random, threading, datetime as dt
 from itertools import product
+from pipeline_funcs.user_utc_region import region_return
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
 _rate_lock = threading.Lock()
 _next_allowed = 0.0
@@ -46,10 +52,10 @@ def get_dates(topic: str) -> DataFrame:
                     ---schedules table is filled first so game dates should never be null, avoiding using coalesce
                     min(game_date) as start_date,
                     max(game_date) as end_date,
-                    max(from_utc_timestamp(current_timestamp(), 'America/Chicago'))::date as todays_date
+                    max(from_utc_timestamp(current_timestamp(), '{user_region}'))::date as todays_date
                 from nhl_data_staged.games.schedules 
                 where 1 = 1
-                    and game_date < date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago'), 2)::date 
+                    and game_date < date_sub(from_utc_timestamp(current_timestamp(), '{user_region}'), 2)::date 
                     and game_type in (2,3)
 
                     
@@ -262,7 +268,7 @@ def merge_insert(api_data: DataFrame, topic: str, game_type: int) -> None:
 
     if api_data: 
         api_data.createOrReplaceTempView("special_teams_insert_tmp")
-        spark.sql("""
+        spark.sql(f"""
                         
             -- Match rows for the same request and endpoint, but only if:
             --   1. the existing record was ingested today or yesterday (allows refreshes), or
@@ -273,10 +279,10 @@ def merge_insert(api_data: DataFrame, topic: str, game_type: int) -> None:
                 and t.api_url = s.api_url 
                 and t.http_status = 200
                 and (
-                    from_utc_timestamp(t.ingest_ts_utc, 'America/Chicago')::date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                    from_utc_timestamp(t.ingest_ts_utc, '{user_region}')::date between 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                     and 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
             
                 )
 
@@ -284,7 +290,7 @@ def merge_insert(api_data: DataFrame, topic: str, game_type: int) -> None:
 
                 t.payload <> s.payload 
                 and s.payload is not null 
-                and s.payload not in ('[]', '{}')
+                and s.payload not in ('[]', '{{}}')
                 and get_json_object(s.payload, "$.total")::integer > 0
                 and s.http_status = 200
 
@@ -374,7 +380,7 @@ games = spark.sql("""
             with parameters as (
 
                 select
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as run_date
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date as run_date
 
             )
             ,

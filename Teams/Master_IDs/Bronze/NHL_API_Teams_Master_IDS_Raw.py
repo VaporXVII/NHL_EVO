@@ -1,13 +1,18 @@
+import sys 
+username = spark.sql("select current_user()").first()[0]
+sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
 from delta.tables import DeltaTable
-
 from zoneinfo import ZoneInfo 
 import datetime as dt, re, requests, json, certifi
+from pipeline_funcs.user_utc_region import region_return 
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 def now_central():
     return dt.datetime.now(central_timezone)
@@ -16,12 +21,21 @@ def today_central():
     return now_central().date()
 today = today_central()
 
-season_check_df = spark.sql("""
+season_check_df = spark.sql(f"""
                             
                             
                 select 
-                    (select max(season) from nhl_data_staged.games.schedules)::integer as sched_current_season,
-                    (select coalesce(max(season), 19001901) from nhl_data_staged.teams.master_ids)::integer as team_ids_season,
+                    (
+                    select max(season) 
+                    from nhl_data_staged.games.schedules 
+                    where 1 = 1
+                        and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(insert_dte, '{user_region}')::date
+                    )::integer as sched_current_season,
+                    (
+                    select 
+                        coalesce(max(season), 19001901) 
+                    from nhl_data_staged.teams.master_ids
+                    )::integer as team_ids_season,
                     not (sched_current_season = team_ids_season)::boolean as new_season_started_ind
                             
     """)
@@ -78,9 +92,28 @@ if current_season_check:
         if not api_data.isEmpty():
             
             api_data.createOrReplaceTempView("teams_api_tmp")
-            spark.sql("""
+            json_schema = spark.sql("select schema_of_json_agg(payload) as json_schema from teams_api_tmp where http_status = 200 and payload is not null").first()["json_schema"]
+            spark.sql(f"""
                       
-                    with src as (
+                    with raw as (
+
+                        select 
+                            season,
+                            endpoint,
+                            request_key,
+                            http_status,
+                            payload,
+                            api_url,
+                            explode(from_json(payload, '{json_schema}')) as json_payload
+                        from teams_api_tmp
+                        where 1 = 1
+                            and payload is not null 
+                            and payload not in ('[]', '{{}}')
+                            and http_status = 200
+
+                    )
+                    ,
+                    src as (
                         
                         ---below safeguards empty payloads from entering
                         select  
@@ -90,12 +123,11 @@ if current_season_check:
                             http_status,
                             payload,
                             api_url
-                        from teams_api_tmp
+                        from raw
                         where 1 = 1
-                            and payload is not null
-                            and payload not in ('[]', '{}')
-                            and coalesce(cast(get_json_object(payload, '$[0].total') as integer), 0) <> 0
-                            and http_status = 200
+                            and json_payload.total::integer > 0 
+                            and size(json_payload.data) > 0
+
                     )
 
                     merge into nhl_data_raw.teams.master_ids t 
@@ -105,7 +137,7 @@ if current_season_check:
                     when matched and (
 
                         (
-                        t.ingest_ts_utc::date <> s.ingest_ts_utc::date
+                        from_utc_timestamp(t.ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
                         or t.http_status <> s.http_status 
                         or t.payload <> s.payload
                         )

@@ -10,15 +10,45 @@ from functools import reduce
 import json, re, datetime
 from pipeline_funcs.games import get_games
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
 kickoff = not get_games(spark, "nhl_data_staged.games.shift_data").isEmpty()
 if kickoff: 
     #section below handles retries for games where there was missing shift data
     #the retry logic relies on an index created based on game_date in the schedules table rather than relying on the current_date() function
     #because we want to retry every 15 days per the NHL schedule 
+    spark.sql(f"""
+                  
+                  
+                with src as (
+                    
+                    select distinct 
+                        b.season,
+                        b.game_id
+                    from nhl_data_staged.ops.games_missing_shift a 
+                    inner join nhl_data_staged.games.games_missing_shift b
+                        on a.season = b.season
+                        and a.game_id = b.game_id
+                    where 1 = 1
+                        
+
+                )
+          
+                merge into nhl_data_staged.ops.games_missing_shift t 
+                using src s 
+                    on t.season = s.season 
+                    and t.game_id = s.game_id 
+
+                when matched then delete;
+            
+                  
+    """)
+    
     run_missing = spark.sql(f"""
     
         with season_param as (
@@ -28,7 +58,7 @@ if kickoff:
                 coalesce(max(season), 19001901) as shift_table_season
             from nhl_data_staged.games.shift_data 
             where 1 = 1
-                and game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                and game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
 
         ) 
         ,
@@ -41,7 +71,7 @@ if kickoff:
                 from nhl_data_staged.games.schedules a 
                 cross join season_param p 
                 where 1 = 1
-                    and a.game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 qualify a.season = max(a.season) over()
         )
         , 
@@ -92,7 +122,7 @@ if kickoff:
                         ---to avoid current day games getting added to the games_missing_shift table
                         ---the shift data endpoint has longer delay than the pbp endpoint does and can be notorious for having data disappear out of nowhere
                         ---for unknown reasons
-                        and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and a.game_date < from_utc_timestamp(current_timestamp(), '{user_region}')::date
                         and a.game_type in (2,3)
                         and a.season >= 20102011
 
@@ -118,16 +148,16 @@ if kickoff:
                     and t.game_id = s.game_id
 
                 when matched and (
-                    
-                    ---using condition check below to ensure that only one retry happens per day
-                    t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
 
+                        ---below ensures that only one retry happens per day but also ensures the 15 day retry 
+                        from_utc_timestamp(current_timestamp(), '{user_region}')::date >= t.next_retry_dte
+                        and t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 )
 
                 then update set 
 
-                    last_attempt_dte = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    last_attempt_dte = from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
                     attempt_count = t.attempt_count + 1,
                     update_dte = current_timestamp()
                 
@@ -140,20 +170,21 @@ if kickoff:
                     attempt_count,
                     insert_dte,
                     update_dte
+
                 )
 
                 values (
 
                     s.season, 
                     s.game_id, 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
                     1,
                     current_timestamp(),
                     null 
                 )
                 
-                when not matched by source then delete;
+                ;
 
         """)
         print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_shift table")
@@ -163,20 +194,20 @@ else:
     print(f"No new data found, skipping insert")
 
 if kickoff: 
-    games = spark.sql("""
+    games = spark.sql(f"""
                     
                 with date_param as (
                     ---start with getting current date of script being ran
-                    select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                    select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
 
                 )
                 , 
                 pbp_game_status as (
                     ---check to see what the status of the game is based on the play by play data (most reliable method)
                     select
-                        game_id
-                        , max(coalesce(game_in_play, false)) as game_in_play
-                        , coalesce(max(1) filter (where event_type = 'game-end'), 0) as has_game_end
+                        game_id,
+                        max(coalesce(game_in_play, false)) as game_in_play,
+                        coalesce(max(1) filter (where event_type = 'game-end'), 0) as has_game_end
                     from nhl_data_staged.games.pbp_data
                     group by game_id
 
@@ -185,12 +216,12 @@ if kickoff:
                 games as (
                 ---pull list of all games and various information 
                     select distinct
-                        a.season
-                        , a.game_id
-                        , a.game_date
-                        , a.start_time_utc
-                        , coalesce(b.game_in_play, false) as game_in_play
-                        , coalesce(b.has_game_end, 0) as has_game_end
+                        a.season,
+                        a.game_id,
+                        a.game_date,
+                        a.start_time_utc,
+                        coalesce(b.game_in_play, false) as game_in_play,
+                        coalesce(b.has_game_end, 0) as has_game_end
                     from nhl_data_staged.games.schedules a
                     left join pbp_game_status b
                         on a.game_id = b.game_id
@@ -198,7 +229,7 @@ if kickoff:
                     where 1 = 1
                         and a.season >= 20102011
                         and a.game_type in (2,3)
-                        and a.game_date <= p.current_run_date
+                        and a.game_date <= p.current_run_dte
 
                 )
                 ,
@@ -214,6 +245,9 @@ if kickoff:
                     from nhl_data_raw.games.shift_data a 
                     inner join games g 
                         on a.request_key = g.game_id 
+                    where 1 = 1
+                        and a.http_status = 200 
+            
                     
                 )
                 , 
@@ -232,38 +266,43 @@ if kickoff:
                     ---since the play by play table is populated before the shift table is, we want to make sure that if a game 
                     ---that was in play today has ended before all shift data could be loaded that we continue to load that data 
                     ---(i.e. game ended 15 minutes prior but the remaining shift data for that game hasn't been inserted into staging tables)
-                    select 
+                    select /*+ broadcast (p) */
                         a.*, 
                         "ended today" as which_game
                     from games a
+                    cross join date_param p
                     where 1 = 1
-                        and game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-                        and has_game_end = 1
+                        and a.game_date = p.current_run_dte
+                        and a.has_game_end = 1
                 )
                 , 
                 games_missing_from_api as (
                 ---check to see if game doesn't have any shift data found in API (this happens more frequently as shift data API endpoint seems to be somewhat unrealiable)
-                    select 
-                        game_id
-                    from nhl_data_staged.ops.games_missing_shift
+                    select /*+ broadcast (p) */
+                        game_id,
+                        "missing" as which_game
+                    from nhl_data_staged.ops.games_missing_shift a 
+                    cross join date_param p
+                    where 1 = 1 
+                        and p.current_run_dte >= a.next_retry_dte
 
                 )
                 , 
                 games_in_play_today as (
                 
                 ---check to see which games are in play today that started at least 15 minutes before the time of the scrape (NHL games always have a lag in start time so don't scrape the API unless the game has truly started)
-                    select distinct
-                        a.season
-                        , a.game_id
-                        , a.game_date
-                        , a.start_time_utc
-                        , a.game_in_play
-                        , 'in play' as which_game
+                    select /*+ broadcast (p) */ distinct
+                        a.season,
+                        a.game_id,
+                        a.game_date,
+                        a.start_time_utc,
+                        a.game_in_play,
+                        "in_play" as which_game
                     from games a
                     cross join date_param p
                     where 1 = 1
-                        and a.game_date = p.current_run_date
-                        and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
+                        and a.game_date = p.current_run_dte
+                        and from_utc_timestamp(current_timestamp(), '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes
                         and a.game_in_play = true
 
                 )
@@ -284,12 +323,12 @@ if kickoff:
                 games_not_loaded as (
                 ---check to see which games have not yet been loaded that aren't part of the games that have already been loaded 
                     select
-                        a.season
-                        , a.game_id
-                        , a.game_date
-                        , a.start_time_utc
-                        , a.game_in_play
-                        , 'not loaded' as which_game
+                        a.season,
+                        a.game_id,
+                        a.game_date,
+                        a.start_time_utc,
+                        a.game_in_play,
+                        'not loaded' as which_game
                     from games a
                     left anti join games_loaded b
                         on a.game_id = b.game_id
@@ -300,16 +339,16 @@ if kickoff:
                 games_prior_two as (
                 ---setting up catch all the continue scraping data for games that have been played in the last 2 days (to ensure data accuracy)
                     select
-                        a.season
-                        , a.game_id
-                        , a.game_date
-                        , a.start_time_utc
-                        , a.game_in_play
-                        , 'last two' as which_game
+                        a.season,
+                        a.game_id,
+                        a.game_date,
+                        a.start_time_utc,
+                        a.game_in_play,
+                        'last two' as which_game
                     from games a
                     cross join date_param p
                     where 1 = 1
-                        and a.game_date between date_sub(p.current_run_date, 2) and date_sub(p.current_run_date, 1)
+                        and a.game_date between date_sub(p.current_run_dte, 2) and date_sub(p.current_run_dte, 1)
 
                 )
                 , 
@@ -383,6 +422,18 @@ if kickoff:
                     which_game,
                     game_in_play
                 from games_prior_two
+                union 
+                select /*+ broadcast (b) */
+                    a.season,
+                    b.game_id,
+                    a.game_date,
+                    a.start_time_utc,
+                    b.which_game,
+                    a.game_in_play
+                from games a 
+                inner join games_missing_from_api b 
+                    on a.game_id = b.game_id
+                    
 
                 )
 
@@ -397,33 +448,33 @@ if kickoff:
                     , a.game_in_play
                     , a.which_game
                 from final_games a
-                left anti join games_missing_from_api b
-                    on a.game_id = b.game_id
+                --left anti join games_missing_from_api b
+                    --on a.game_id = b.game_id
 
                 )
 
                 , 
                 raw_data as (
 
-                select
-                    request_key,
-                    payload,
-                    ingest_ts_utc,
-                    from_json(payload, 'struct<data: array<string>, total: int>') as payload_json,
-                    get_json_object(payload, "$.total") as payload_total_rows
-                from nhl_data_raw.games.shift_data a  
-                left anti join quarantined_rows b 
-                    on a.request_key = b.game_id
-                where 1 = 1
-                    and http_status = 200
-                    and substring(request_key, 1, 4)::int >= 2010
+                    select
+                        request_key,
+                        payload,
+                        ingest_ts_utc,
+                        from_json(payload, 'struct<data: array<string>, total: int>') as payload_json,
+                        get_json_object(payload, "$.total") as payload_total_rows
+                    from nhl_data_raw.games.shift_data a  
+                    --left anti join quarantined_rows b 
+                        --on a.request_key = b.game_id
+                    where 1 = 1
+                        and http_status = 200
+                        and substring(request_key, 1, 4)::integer >= 2010
 
                 )
 
 
 
                 select
-                    date_format(from_utc_timestamp(a.start_time_utc, 'America/Chicago'), 'hh:mm a') as game_start_time_cst
+                    date_format(from_utc_timestamp(a.start_time_utc, '{user_region}'), 'hh:mm a') as game_start_time_cst
                     , a.*
                     , b.payload
                 from final_games_clean a
@@ -431,9 +482,7 @@ if kickoff:
                     on a.game_id = b.request_key
                 where 1 = 1
                     and b.payload is not null
-                    ---and b.payload_json is not null
                     and b.payload_total_rows > 0 
-                    ---and b.payload_json.data is not null
                     and size(b.payload_json.data) > 0
                 qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1
                 order by a.game_date desc;
@@ -595,10 +644,10 @@ if ready:
     )
     
     
-    quarantine_rows = (
-                        shifts_data
-                        .filter(quarantine_condition)
-                        .withColumn("quarantine_reason", quarantine_reason)
+    quarantine = (
+                    shifts_data
+                    .filter(quarantine_condition)
+                    .withColumn("quarantine_reason", quarantine_reason)
                                 
                     )
     
@@ -616,16 +665,17 @@ if ready:
     )
     shift_insert_ready = not shifts_data.isEmpty()
     rosters_ready_insert = not rosters_data.isEmpty()
-    quarantine_insert_ready = not quarantine_rows.isEmpty()
+    quarantine_insert_ready = not quarantine.isEmpty()
 
 if shift_insert_ready:
 
     shifts_data.createOrReplaceTempView("shift_insert_tmp")
+    quarantine.createOrReplaceTempView("shift_quarantine_tmp")
     spark.sql(f"""
               
             with src as (
 
-                select 
+                select /*+ broadcast (t) */
                     s.season, 
                     s.game_id,
                     s.game_date,
@@ -653,7 +703,13 @@ if shift_insert_ready:
                 from shift_insert_tmp s 
                 inner join nhl_data_staged.teams.master_ids t 
                     on s.team_id = t.team_id 
+                left anti join shift_quarantine_tmp q 
+                    on s.season = q.season 
+                    and s.game_id = q.game_id 
+                    and s.game_date = q.game_date 
+                    and s.shift_id = q.shift_id 
                 where 1 = 1
+
             )
             
             merge into nhl_data_staged.games.shift_data t 
@@ -663,9 +719,9 @@ if shift_insert_ready:
                 and t.team_id = s.team_id
                 and t.shift_id = s.shift_id 
                 and t.game_date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                     and 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
         
             when matched and (
 
@@ -710,7 +766,7 @@ if shift_insert_ready:
                 logic_block = "match one"
 
             when matched and 
-                t.game_date between date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) and from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                t.game_date between date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) and from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 and not (t.game_in_play <=> s.game_in_play)
                 
             then update set 
@@ -786,7 +842,7 @@ if shift_insert_ready:
                 and t.game_in_play = true
                 and t.active_row = true
                 ---below ensures that only rows that are on current date are being looked at for updates that are missing in source
-                and t.game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                and t.game_date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
 
             then update set 
 
@@ -798,7 +854,7 @@ if shift_insert_ready:
             when not matched by source 
                 and t.game_in_play = false
                 and t.active_row = true
-                and t.game_date between date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) and date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
+                and t.game_date between date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) and date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 1)
 
             then update set 
 
@@ -810,14 +866,13 @@ if shift_insert_ready:
               
     """)
     spark.catalog.dropTempView("shift_insert_tmp")
+    if not quarantine_insert_ready: 
+        spark.catalog.dropTempView("shift_quarantine_tmp")
     print(f"Shift data successfully loaded into nhl_data_staged.games.shift_data table")
-    if datetime.datetime.today().day % 5 == 1:
-        spark.sql("""analyze table nhl_data_staged.games.shift_data compute statistics;""")
-        spark.sql("""optimize nhl_data_staged.games.shift_data;""")
-        spark.sql("""vacuum nhl_data_staged.games.shift_data;""")
-        spark.sql("""analyze table nhl_data.games.shift_data compute statistics;""")
-        spark.sql("""optimize nhl_data.games.shift_data;""")
-        spark.sql("""vacuum nhl_data.games.shift_data;""")
+    if datetime.datetime.today().day % 5 == 0:
+        run_table_maint(spark, "nhl_data_staged.games.shift_data")
+        run_table_maint(spark, "nhl_data.games.shift_data")
+
 else: 
     print(f"No new data to insert into nhl_data_staged.games.shift_data, skipping insert")
 
@@ -842,9 +897,9 @@ if rosters_ready_insert:
                 and t.player_id = s.player_id
                 and t.team_id = s.team_id
                 and t.game_date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                     and 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 
 
             when matched and (
@@ -940,8 +995,8 @@ else:
 
 if quarantine_insert_ready:
 
-    quarantine_rows.createOrReplaceTempView("shift_quarantine_tmp")
-    spark.sql("""
+    quarantine.createOrReplaceTempView("shift_quarantine_tmp")
+    spark.sql(f"""
                 
         merge into nhl_data_staged.quarantine.shift_data t 
         using shift_quarantine_tmp s 

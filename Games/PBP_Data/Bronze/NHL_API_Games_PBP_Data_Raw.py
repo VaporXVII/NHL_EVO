@@ -12,9 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque 
 from pipeline_funcs.games import get_games
 from pipeline_funcs.api_utils import * 
+from pipeline_funcs.user_utc_region import region_return
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
 def find_games(limit_n: int, raw_schema: str = None) -> DataFrame: 
 
@@ -24,7 +26,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                          
             with date_param as (
 
-                select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
 
             )
             , 
@@ -80,7 +82,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     where 1 = 1
                         and a.game_date = p.current_run_date
                         ---NHL games typically don't start until at least 15 minutes after scheduled start time
-                        and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
+                        and from_utc_timestamp(current_timestamp(), '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes
 
                 )
                 ,
@@ -251,14 +253,103 @@ def flush_api_data(api_data: list) -> int:
             #.drop("game_idx")
 
     )
-  
+    
     merge_insert_found(batch_data = api_data_df)
+    json_schema = (
+
+            api_data_df
+            .selectExpr("schema_of_json_agg(payload) as json_schema")
+            .first()["json_schema"]
+    )
+    missing_payloads = (
+
+            api_data_df 
+            .withColumn("parsed_json", f.from_json(f.col("payload"), json_schema))
+            .filter(f.size(f.col("parsed_json.plays")) == 0)
+            .drop("parsed_json")
+    )
+    if not missing_payloads.isEmpty():
+        update_missing_games(batch_data = missing_payloads)
+    
     row_cnt = len(api_data)
 
     api_data.clear()
     gc.collect()
 
     return row_cnt
+
+def update_missing_games(batch_data, DataFrame) -> None:
+
+    try: 
+        
+        batch_data.createOrReplaceTempView("pbp_data_missing_tmp")
+        spark.sql(f"""
+                  
+                  
+                with date_param as (
+
+                    select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
+                ) 
+                ,
+                src as (
+                    
+                    ---need to grab the season associated with the game that is going to be inserted into games_missing_pbp table
+                    select /*+ broadcast (p) */ distinct 
+                        a.season,
+                        b.request_key as game_id 
+                    from nhl_data_staged.games.schedules a
+                    cross join date_param p 
+                    inner join pbp_data_missing_tmp b 
+                        on a.game_id = b.request_key
+                    where 1 = 1
+                        and a.game_type in (2,3)
+                        and a.game_date <= p.current_run_dte
+
+                )
+                
+                merge into nhl_data_staged.games.games_missing_pbp t 
+                using src s 
+                    on t.season = s.season 
+                    and t.game_id = s.game_id 
+                
+                when matched then update set 
+
+                    last_attempt_dte = from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
+                    attempt_count = t.attempt_count + 1,
+                    update_dte = current_timestamp()
+                
+                when not matched then insert (
+
+                    season, 
+                    game_id, 
+                    last_attempt_dte,
+                    next_retry_dte,
+                    attempt_count,
+                    insert_dte,
+                    update_dte
+                )
+
+                values (
+
+                    s.season, 
+                    s.game_id, 
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
+                    1,
+                    current_timestamp(),
+                    null 
+                )
+                
+                ;
+                  
+        
+        """)
+        spark.catalog.dropTempView("pbp_data_missing_tmp")
+        print("Batch successfully inserted into nhl_data_staged.ops.pbp_missing_shift table")
+        print("=" * 100)
+    except Exception as e: 
+        print(f"Error occured during insert into nhl_data_staged.ops.pbp_missing_shift table: {e}")
 
 def merge_insert_found(batch_data: DataFrame) -> None:
 
@@ -318,7 +409,7 @@ def merge_insert_found(batch_data: DataFrame) -> None:
                     null
                 )
                 
-                """)
+        """)
         spark.catalog.dropTempView("pbp_data_tmp")
         print("Batch successfully inserted into nhl_data_raw.games.pbp_data table")
         print("=" * 100)
@@ -327,6 +418,8 @@ def merge_insert_found(batch_data: DataFrame) -> None:
 
 kickoff = not get_games(spark, table_name = "nhl_data_raw.games.pbp_data").isEmpty()
 if kickoff:
+    print(f"Starting batch scrape process...")
+    print("=" * 50)
     batch_size = 500
     max_loops = 75
     api_data, missing_games = [], [] 
@@ -353,6 +446,7 @@ if kickoff:
             break 
         games = find_games(limit_n = batch_size, raw_schema = pbp_schema)
         if games.isEmpty():
+            print(f"No eligible games found, skipping scrape...")
             break 
         buckets = {row["which_game"] for row in games.select("which_game").distinct().collect()}
         final_pass = buckets.issubset({"in play", "last_two", "ended today", "loaded but missing data"})
@@ -362,7 +456,6 @@ if kickoff:
         n_batches = math.ceil(total_games / batch_size)
 
         for batch_num, batch_rows in enumerate(chunk_list(pbp_data_urls, batch_size), start = 1):
-            #print(f"Starting batch {batch_num} of {n_batches}")
             print(f"Starting batch {n} of {max_loops}...")
             urls = [row["api_url"] for row in batch_rows]
             batch_results = scrape_batch(urls = urls, endpoint = "pbp_data")
@@ -387,4 +480,5 @@ if kickoff:
 
         if final_pass: 
             break 
-    print(f"Done, total rows written = {rows_written_total:,}")
+    print("=" * 50)
+    print(f"Done, total rows written = {rows_written_total:,}") if rows_written_total > 0 else print(f"Done")
