@@ -449,7 +449,7 @@ create table if not exists nhl_data_raw.games.pbp_data (
 )
 using delta 
 cluster by (ingest_ts_utc)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true);
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.logRetentionDuration' = '30 days');
 
 
 create table if not exists nhl_data_staged.games.pbp_data (
@@ -513,7 +513,7 @@ create table if not exists nhl_data_staged.games.pbp_data (
 )
 using delta 
 cluster by (season, game_date, game_id)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true');
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true', 'delta.logRetentionDuration' = '30 days');
 
 
 create table if not exists nhl_data.games.pbp_data (
@@ -554,7 +554,7 @@ create table if not exists nhl_data.games.pbp_data (
 )
 using delta 
 cluster by (season, game_date, game_id)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true');
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true', 'delta.logRetentionDuration' = '30 days');
 
 --Shift Data
 
@@ -572,7 +572,7 @@ create table if not exists nhl_data_raw.games.shift_data (
 )
 using delta 
 cluster by (ingest_ts_utc)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true);
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.logRetentionDuration' = '30 days');
 
 create table if not exists nhl_data_staged.games.shift_data (
 
@@ -608,7 +608,7 @@ create table if not exists nhl_data_staged.games.shift_data (
 )
 using delta
 cluster by (season, game_date, game_id)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true');
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true', 'delta.logRetentionDuration' = '30 days');
 
 create table if not exists nhl_data.games.shift_data (
 
@@ -637,7 +637,7 @@ create table if not exists nhl_data.games.shift_data (
 )
 using delta 
 cluster by (season, game_date, game_id) 
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true');
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true', 'delta.logRetentionDuration' = '30 days');
 
 --Teams
 
@@ -735,7 +735,7 @@ create table if not exists nhl_data.teams.details (
   team_abbrev string not null, 
   team_name string not null,
   is_active boolean not null, 
-  active_from date not null, 
+  active_from date, 
   active_to date,
   insert_dte timestamp not null, 
   update_dte timestamp
@@ -900,7 +900,7 @@ create table if not exists nhl_data_staged.players.master_ids (
 
 using delta 
 cluster by (last_active_season, player_id)
-tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true');
+tblproperties (delta.autoOptimize.optimizeWrite = true, delta.enableChangeDataFeed = true, 'delta.enableDeletionVectors' = 'true', 'delta.deletedFileRetentionDuration' = '30 days');
 
 
 create table if not exists nhl_data.players.master_ids (
@@ -915,7 +915,7 @@ create table if not exists nhl_data.players.master_ids (
 )
 using delta
 cluster by (player_id)
-tblproperties (delta.enableChangeDataFeed = true);
+tblproperties (delta.enableChangeDataFeed = true, 'delta.deletedFileRetentionDuration' = '30 days');
 
 
 create table if not exists nhl_data_raw.players.player_game_rosters (
