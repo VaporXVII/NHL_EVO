@@ -10,9 +10,11 @@ from functools import reduce
 import re, json, time, datetime
 from pipeline_funcs.games import get_games
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
+from pipeline_funcs.user_utc_region import get_region
 
+user_region = get_region()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
 def flatten_df(df):
     
@@ -44,6 +46,32 @@ if kickoff:
     #section below handles retries for games where there was missing play by play data
     #the retry logic relies on an index created based on game_date in the schedules table rather than relying on the current_date() function
     #because we want to retry every 15 days per the NHL schedule 
+    spark.sql(f"""
+                  
+                  
+                with src as (
+                    
+                    select distinct 
+                        b.season,
+                        b.game_id
+                    from nhl_data_staged.ops.games_missing_pbp a 
+                    inner join nhl_data_staged.games.pbp_data b
+                        on a.season = b.season
+                        and a.game_id = b.game_id
+                    where 1 = 1
+                        
+
+                )
+          
+                merge into nhl_data_staged.ops.games_missing_pbp t 
+                using src s 
+                    on t.season = s.season 
+                    and t.game_id = s.game_id 
+
+                when matched then delete;
+            
+                  
+    """)
     run_missing = spark.sql(f"""
     
         with season_param as (
@@ -53,7 +81,7 @@ if kickoff:
                 coalesce(max(season), 19001901) as pbp_table_season
             from nhl_data_staged.games.pbp_data 
             where 1 = 1
-                and game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
 
         )      
         ,
@@ -63,10 +91,10 @@ if kickoff:
                     a.season, 
                     a.game_date,
                     (p.pbp_table_season = 19001901)::boolean as cold_start_ind
-                from nhl_data_staged.games.schedules 
+                from nhl_data_staged.games.schedules a
                 cross join season_param p
                 where 1 = 1
-                    and a.game_date <= from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 qualify a.season = max(a.season) over()
         )
         , 
@@ -88,13 +116,25 @@ if kickoff:
     
     """)
     run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
-    pbp_schema = spark.sql("""
+    pbp_schema = spark.sql(f"""
                            
+                    with schema_sample as (
+
+                        select payload 
+                        from nhl_data_raw.games.pbp_data 
+                        tablesample (10 rows) 
+                        where 1 = 1
+                            and payload is not null  
+                            and http_status = 200 
+                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
+                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
+
+                    )
+
                     select schema_of_json_agg(payload) as json_schema 
-                    from nhl_data_raw.games.pbp_data 
+                    from schema_sample
                     where 1 = 1
-                        and payload is not null 
-                        and http_status = 200 
+                
                            
     """).first()["json_schema"]
     if run_missing_ind:
@@ -116,7 +156,7 @@ if kickoff:
                     where 1 = 1
                         ---want to avoid games that are in play today in the vent that the game hasn't started yet or the data feed is slightly delayed
                         ---to avoid current day games getting added to the games_missing_pbp table
-                        and a.game_date < from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                        and a.game_date < from_utc_timestamp(current_timestamp(), '{user_region}')::date
                         and a.game_type in (2,3)
 
                 )
@@ -126,6 +166,7 @@ if kickoff:
                     select * 
                     from staged 
                     where 1 = 1
+                        ----check to see if the payload was empty, in the pbp data payload we must use the size of ---the json.plays element to gauge if data is missing
                         and payload_json is not null 
                         and size(payload_json.plays) = 0 
 
@@ -138,15 +179,16 @@ if kickoff:
                     and t.game_id = s.game_id
 
                 when matched and (
-                    
-                    ---using condition check below to ensure that only one retry happens per day
-                    t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
 
+                        ---below ensures that only one retry happens per day but also ensures the 15 day retry 
+                        from_utc_timestamp(current_timestamp(), '{user_region}')::date >= t.next_retry_dte
+                        and t.last_attempt_dte <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 )
+                
                 then update set 
 
-                    last_attempt_dte = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    last_attempt_dte = from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    next_retry_dte = date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
                     attempt_count = t.attempt_count + 1,
                     update_dte = current_timestamp()
 
@@ -166,14 +208,14 @@ if kickoff:
 
                     s.season,
                     s.game_id,
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date,
-                    date_add(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 15),
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date,
+                    date_add(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 15),
                     1,
                     current_timestamp(),
                     null
                 )
                   
-                when not matched by source then delete;
+                ;
                   
         """)
         print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_pbp table")
@@ -183,12 +225,12 @@ else:
     print(f"No new data found, skipping insert")
 
 if kickoff: 
-    games = spark.sql("""
+    games = spark.sql(f"""
                                         
                         ---pull in all games up until the current date (inclusive)
                         with date_param as (
 
-                            select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
 
                         ) 
                         , 
@@ -247,7 +289,7 @@ if kickoff:
                             cross join date_param p 
                             where 1 = 1
                                 and a.game_date = p.current_run_date
-                                and from_utc_timestamp(current_timestamp(), 'America/Chicago') >= from_utc_timestamp(a.start_time_utc, 'America/Chicago') + interval 15 minutes
+                                and from_utc_timestamp(current_timestamp(), '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes
 
                         )
                         ,
@@ -298,9 +340,12 @@ if kickoff:
                         ---pull in games that didn't have any pbp data in the API
                         games_missing_from_api as (
 
-                            select 
+                            select /*+ broadcast (p) */
                                 game_id
-                            from nhl_data_staged.ops.games_missing_pbp
+                            from nhl_data_staged.ops.games_missing_pbp a 
+                            cross join date_param p
+                            where 1 = 1
+                                --and p.current_run_dte >= a.next_retry_dte
 
                         )
                         ,
@@ -358,6 +403,17 @@ if kickoff:
                                 game_date,
                                 start_time_utc
                             from games_prior_two
+                            union 
+                            select /*+ broadcast (b) */
+                                "missing" as which_game,
+                                a.season,
+                                b.game_id,
+                                a.game_date,
+                                a.start_time_utc
+                            from games a  
+                            inner join games_missing_from_api b 
+                                on a.game_id = b.game_id
+
 
                         )
 
@@ -372,7 +428,7 @@ if kickoff:
                         where 1 = 1
                             and b.http_status = 200
                             and b.payload is not null 
-                            and b.payload not in ('[]', '{}')
+                            and b.payload not in ('[]', '{{}}')
                         ---using below as a safeguard against dupe rows that may have snuck into raw table since this stream refreshes every 20-30 minutes
                         ---don't want to use where ingest_ts_utc::date = current_date() since these needs to work with a cold start
                         qualify row_number() over (partition by b.request_key order by b.ingest_ts_utc desc) = 1    
@@ -404,11 +460,11 @@ if kickoff:
                         
                         
         """)
-    current_rosters = spark.sql("""
+    current_rosters = spark.sql(f"""
                                 
                         with date_param as (
 
-                            select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
 
 
                         )
@@ -436,7 +492,7 @@ if kickoff:
                                 p.current_run_date
                                 
                                 
-        """)
+    """)
 
     ready = not games.isEmpty()
 
@@ -666,7 +722,7 @@ if ready:
                                 .withColumn("game_in_play", 
                                             
                                                 f.when(f.col("game_date") < f.date_sub(f.to_date(
-                                                                                f.from_utc_timestamp(f.current_timestamp(), "America/Chicago")
+                                                                                f.from_utc_timestamp(f.current_timestamp(),f'{user_region}')
                                                                                 ), 2), f.lit(False))
                                             .otherwise(f.lit(True))
                                             
@@ -705,7 +761,7 @@ if ready:
                                                 f.lit(False)
                                         )
                                         .when(
-                                                (f.col("raw.raw_game_id").isNotNull()) & (f.col("game_date") == f.to_date(f.from_utc_timestamp(f.current_timestamp(), 'America/Chicago'))),
+                                                (f.col("raw.raw_game_id").isNotNull()) & (f.col("game_date") == f.to_date(f.from_utc_timestamp(f.current_timestamp(), f'{user_region}'))),
                                                 f.lit(False)
                                         )
                                         .when(
@@ -714,7 +770,7 @@ if ready:
                                                 f.lit(False)
                                         )
                                         .when(
-                                                (f.col("pbp.game_date") == f.date_sub(f.to_date(f.from_utc_timestamp(f.current_timestamp(), 'America/Chicago')), 1)) &
+                                                (f.col("pbp.game_date") == f.date_sub(f.to_date(f.from_utc_timestamp(f.current_timestamp(), f'{user_region}')), 1)) &
                                                 (f.col("raw.raw_game_id").isNull()),
                                                 f.lit(True)
                                         )
@@ -826,9 +882,22 @@ if ready:
 if pbp_insert_ready: 
 
     pbp_data.createOrReplaceTempView("pbp_insert_tmp")
+    quarantine.createOrReplaceTempView("pbp_quarantine_tmp")
     spark.sql(f"""
               
-              
+        with src as (
+
+            select 
+                a.*
+            from pbp_insert_tmp a 
+            left anti join quarantine_tmp b 
+                on a.season = b.season 
+                and a.game_id = b.game_id 
+                and a.game_date = b.game_date
+                and a.event_idx = b.event_idx
+
+        )
+
         merge into nhl_data_staged.games.pbp_data t 
         using pbp_insert_tmp s
             on t.season = s.season
@@ -836,9 +905,9 @@ if pbp_insert_ready:
             and t.game_date = s.game_date 
             and t.event_idx = s.event_idx 
             and t.game_date between 
-                date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                 and 
-                from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                from_utc_timestamp(current_timestamp(), '{user_region}')::date
 
         when matched and (
 
@@ -936,7 +1005,7 @@ if pbp_insert_ready:
                             )
 
         when matched and 
-            t.game_date >= date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2)
+            t.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
             and not (t.game_in_play <=> s.game_in_play)
         then update set 
             game_in_play = s.game_in_play,
@@ -1064,7 +1133,7 @@ if pbp_insert_ready:
         when not matched by source 
             and t.game_in_play = true
             and t.active_row = true
-            and game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+            and game_date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
             --and game_date between date_sub(current_date(), 2) and current_date()
             then update set 
                 update_dte = current_timestamp(),
@@ -1087,7 +1156,7 @@ if pbp_insert_ready:
         when not matched by source 
             and t.game_in_play = false 
             and t.active_row = true
-            and t.game_date between date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) and date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
+            and t.game_date between date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) and date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 1)
             then update set 
                 update_dte = current_timestamp(),
                 py_source = '{py_source}',
@@ -1111,8 +1180,10 @@ if pbp_insert_ready:
               
     """)
     spark.catalog.dropTempView("pbp_insert_tmp")
+    if not quarantine_insert_ready: 
+        spark.catalog.dropTempView("pbp_quarantine_tmp")
     print(f"Play by Play data successfully loaded into nhl_data_staged.games.pbp_data table")
-    if datetime.datetime.today().day % 5 == 1:
+    if datetime.datetime.today().day % 5 == 0:
         spark.sql("""analyze table nhl_data_staged.games.pbp_data compute statistics;""")
         spark.sql("""optimize nhl_data_staged.games.pbp_data;""")
         spark.sql("""vacuum nhl_data_staged.games.pbp_data;""")
@@ -1225,8 +1296,76 @@ if ready:
                 print(e)
 
 if rosters_insert_ready: 
-
     rosters_ready.createOrReplaceTempView("rosters_ready_tmp")
+    spark.sql(f"""
+              
+            with src as (
+
+                select /*+ broadcast (b) */ distinct 
+                    a.season, 
+                    a.player_id, 
+                    a.team_id,
+                    b.team_abbrev,
+                    a.jersey_num
+                from rosters_ready_tmp a 
+                inner join nhl_data_staged.teams.master_ids b 
+                    on a.team_id = b.team_id 
+            
+            )          
+
+            merge into nhl_data_staged.players.master_ids t 
+            using src s 
+                on t.player_id = s.player_id 
+
+            when matched and (
+
+                    coalesce(t.last_active_season, 19001901) <> s.last_active_season 
+                    or coalesce(t.jersey_num, 999) <> coalesce(s.jersey_num, 999)
+
+            )
+
+            then update set 
+
+                    last_active_season = s.season,
+                    jersey_num = coalesce(s.jersey_num, s.jersey_num),
+                    is_active = true,
+                    update_dte = current_timestamp(),
+                    py_source = '{py_source}',
+                    failed_condition = nullif(
+                                    concat_ws(
+                                        ', '
+                                        , filter(
+                                            array(
+                                                case when not (t.last_active_season <=> s.last_active_season) then 'last_active_season' end
+                                                , case when not (t.jersey_num <=> s.jersey_num) then 'jersey_num' end
+                                            )
+                                            , x -> x is not null
+                                        )
+                                    )
+                                    , ''
+                                )
+
+            when matched and not (t.team_id <=> s.team_id)
+
+            then update set 
+
+                    team_id = s.team_id, 
+                    team_abbrev = s.team_abbrev,
+                    team_id_prev_team = coalesce(t.team_id, t.team_id_prev_team),
+                    team_abbrev_prev_team = coalesce(t.team_abbrev, t.team_abbrev_prev_team),
+                    is_active = true,
+                    update_dte = current_timestamp(), 
+                    py_source = '{py_source}',
+                    failed_condition = 'team_id'
+              
+        
+    """)
+    print(f"New players data successfully loaded into nhl_data_staged.players.master_ids table")
+else: 
+    print(f"No new data to insert into nhl_data_staged.players.master_ids, skipping insert")
+
+if rosters_insert_ready: 
+
     spark.sql(f"""
               
         
@@ -1238,9 +1377,9 @@ if rosters_insert_ready:
                 and t.player_id = s.player_id
                 and t.team_id = s.team_id
                 and t.game_date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                     and 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
                 
 
             when matched and (
@@ -1259,7 +1398,7 @@ if rosters_insert_ready:
                 season = s.season,
                 player_name = s.player_name, 
                 player_pos = s.player_pos, 
-                jersey_num = s.jersey_num, 
+                jersey_num = coalesce(s.jersey_num, t.jersey_num), 
                 shoots_catches = coalesce(s.shoots_catches, t.shoots_catches), 
                 is_active = true, 
                 game_in_play = s.game_in_play,
@@ -1337,16 +1476,16 @@ else:
 
 if quarantine_insert_ready: 
 
-    quarantine.createOrReplaceTempView("pbp_quarantine_tmp")
-    spark.sql("""
+    
+    spark.sql(f"""
                 
         merge into nhl_data_staged.quarantine.pbp_data t 
         using pbp_quarantine_tmp s 
             on t.season = s.season
             and t.game_id = s.game_id 
             and t.game_date = s.game_date
-            and t.game_date = s.game_date 
             and t.event_idx = s.event_idx 
+
         
         when not matched then insert (
 
@@ -1465,6 +1604,6 @@ if quarantine_insert_ready:
                   
     """)
     spark.catalog.dropTempView("pbp_quarantine_tmp")
-    print(f"Shift data successfully loaded into nhl_data_staged.quarantine.pbp_data table")
+    print(f"Play by Play data successfully loaded into nhl_data_staged.quarantine.pbp_data table")
 else: 
     print(f"No new data to insert into nhl_data_staged.quarantine.pbp_data, skipping insert")

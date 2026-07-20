@@ -93,13 +93,21 @@ if kickoff:
     
     """)
     run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
-    shift_schema = spark.sql("""
+    shift_schema = spark.sql(f"""
                              
+                        with schema_sample as (
+
+                            select payload 
+                            from nhl_data_raw.games.shift_data 
+                            tablesample (10 rows)
+                            where 1 = 1
+                                and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
+                                and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
+
+                        )
+
                         select schema_of_json_agg(payload) as json_schema
-                        from nhl_data_raw.games.shift_data 
-                        where 1 = 1
-                            and payload is not null 
-                            and http_status = 200                          
+                        from schema_sample                      
                             
     """).first()["json_schema"]
     if run_missing_ind: 
