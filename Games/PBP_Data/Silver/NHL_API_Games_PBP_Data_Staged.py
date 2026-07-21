@@ -230,7 +230,7 @@ if kickoff:
                         ---pull in all games up until the current date (inclusive)
                         with date_param as (
 
-                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
+                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
 
                         ) 
                         , 
@@ -245,7 +245,7 @@ if kickoff:
                             cross join date_param p 
                             where 1 = 1
                                 and a.game_type in (2, 3)
-                                and a.game_date <= p.current_run_date
+                                and a.game_date <= p.current_run_dte
 
 
                         )
@@ -266,7 +266,7 @@ if kickoff:
                                 and a.game_date = b.game_date
                             cross join date_param p
                             where 1 = 1
-                                and a.game_date = p.current_run_date
+                                and a.game_date = p.current_run_dte
                                 and a.event_type = 'game-end'
 
 
@@ -288,7 +288,7 @@ if kickoff:
                                 and a.game_date = b.game_date 
                             cross join date_param p 
                             where 1 = 1
-                                and a.game_date = p.current_run_date
+                                and a.game_date = p.current_run_dte
                                 and from_utc_timestamp(current_timestamp(), '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes
 
                         )
@@ -305,9 +305,9 @@ if kickoff:
                             cross join date_param p
                             where 1 = 1
                                 and a.game_date between 
-                                    date_sub(p.current_run_date, 2) 
+                                    date_sub(p.current_run_dte, 2) 
                                     and 
-                                    date_sub(p.current_run_date, 1)
+                                    date_sub(p.current_run_dte, 1)
                                 
 
                         )
@@ -332,7 +332,7 @@ if kickoff:
                             cross join date_param p
                             where 1 = 1
                                 and a.game_id is not null
-                                and a.game_date < p.current_run_date
+                                and a.game_date < p.current_run_dte
                                 and a.event_type = 'game-end'
 
                         )
@@ -362,7 +362,7 @@ if kickoff:
                                 on a.game_id = b.game_id
                             cross join date_param p 
                             where 1 = 1
-                                and a.game_date < p.current_run_date
+                                and a.game_date < p.current_run_dte
 
                         )
                         ,
@@ -464,7 +464,7 @@ if kickoff:
                                 
                         with date_param as (
 
-                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
+                            select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
 
 
                         )
@@ -487,9 +487,9 @@ if kickoff:
                         cross join date_param p
                         where 1 = 1
                             and a.insert_dte::date between 
-                                date_sub(p.current_run_date, 1) 
+                                date_sub(p.current_run_dte, 1) 
                                 and 
-                                p.current_run_date
+                                p.current_run_dte
                                 
                                 
     """)
