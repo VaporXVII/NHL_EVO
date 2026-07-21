@@ -8,29 +8,41 @@ from delta.tables import DeltaTable
 import datetime as dt, re
 from zoneinfo import ZoneInfo 
 from pipeline_funcs.schema_utils import apply_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
-sched_staged = spark.sql("""
+sched_staged = spark.sql(f"""
           
                     select 
-                        a.*
+                        a.season,
+                        a.game_date,
+                        a.game_id,
+                        a.game_type,
+                        a.team_id,
+                        a.team_abbrev,
+                        a.home_road,
+                        a.start_time_utc,
+                        a.eastern_utc_offset,
+                        a.venue_utc_offset
                     from nhl_data_staged.games.schedules a 
                     where 1 = 1
                     ---limit to only games that are in play on the current date 
                     ---or games that were added to the schedules staged area on the 
                     ---current date, same with update date
-                        and a.game_date = from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-                        or (
-                            a.insert_dte::date >= date_sub(current_date(), 1) 
+                        ---and a.game_date = from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                        and (
+                            a.insert_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 
                             or 
-                            a.update_dte::date >= date_sub(current_date(), 1)
+                            a.update_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7)
                             )
                         
                     
-                    """)
+    """)
 ready = not sched_staged.isEmpty()
 
 insert_ready = False
@@ -100,7 +112,7 @@ if ready:
 if insert_ready: 
 
     sched_df.createOrReplaceTempView("schedules_insert_tmp")
-    spark.sql("""
+    spark.sql(f"""
 
         merge into nhl_data.games.schedules t 
         using schedules_insert_tmp s 
@@ -109,17 +121,30 @@ if insert_ready:
             and t.team_id = s.team_id
             and s.team_id > 0 
             and s.team_id is not null 
-            and t.game_date between 
-                date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
-                and 
-                from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-        
+            and (
+                (
+                    t.game_date between 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 
+                    and 
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                )
+                or 
+                (
+                    from_utc_timestamp(t.insert_dte, '{user_region}')::date between 
+                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7)
+                    and 
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                )
+
+        )
+
         when matched and (
 
             t.game_date <> s.game_date 
             or t.game_type <> s.game_type 
-            or not (t.start_time <=> s.start_time) 
-            or not (t.home_road <=> s.home_road)
+            or coalesce(t.start_time, '0') <> coalesce(s.start_time, t.start_time, '0')
+            or coalesce(t.home_road, 'NONE') <> coalesce(s.home_road, t.home_road, 'NONE')
+
 
         )
 
@@ -164,5 +189,6 @@ if insert_ready:
     """)
     spark.catalog.dropTempView("schedules_insert_tmp")
     print(f"Schedules data successfully loaded into nhl_data.games.schedules table")
+    run_table_maint(spark, "nhl_data.games.schedules")
 else: 
     print(f"No new data to insert into nhl_data.games.schedules, skipping insert")

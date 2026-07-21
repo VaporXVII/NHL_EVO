@@ -8,10 +8,13 @@ from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo 
 import datetime as dt, re, json, datetime
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
+from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
+user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "America/Chicago")
-central_timezone = ZoneInfo("America/Chicago")
+spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
+central_timezone = ZoneInfo(f"{user_region}")
 
 def wrangle_data(df: DataFrame, pov: str) -> DataFrame:
 
@@ -64,11 +67,11 @@ def clean_data(df: DataFrame) -> DataFrame:
 
     return d
 
-sched_raw = spark.sql("""
+sched_raw = spark.sql(f"""
                       
                       with date_param as (
 
-                        select from_utc_timestamp(current_timestamp(), 'America/Chicago')::date as current_run_date
+                        select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
                         
                       )
                       
@@ -81,14 +84,73 @@ sched_raw = spark.sql("""
                         ---below pulls in game on the current date or games that were ingested within 
                         ---the last 7 days (this is for playoff games since the NHL will publish the series schedule for the first 6 games 
                         ---but then the series ends before the game is scheduled))
+                        and http_status = 200
                         and (
-                            ingest_ts_utc::date = current_run_date
+                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = current_run_date
                             or 
-                            ingest_ts_utc::date between date_sub(current_run_date, 7) and current_run_date
+                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_date, 7) and current_run_date
                             )
                       
     """)
 ready = not sched_raw.isEmpty()
+
+field_mapping = {
+
+        "season": {
+                    "target": "season", 
+                    "type": "integer"
+        },
+        "id":   {
+                    "target": "game_id", 
+                    "type": "bigint"
+        },
+        "date": {
+                    "target": "game_date", 
+                    "type": "date"
+        },
+        "gameType": {
+                    "target": "game_type", 
+                    "type": "integer"
+        },
+        "startTimeUTC": {
+
+                    "target": "startTimeUTC", 
+                    "type": "string"
+        },
+        "easternUTCOffset": {
+                    "target": "easternUTCOffset",
+                    "type": "string"
+        },
+        "venueUTCOffset": {
+                    "target": "venueUTCOffset", 
+                    "type": "string"
+        },
+        "venueTimezone": {
+                    "target": "venueTimezone", 
+                    "type": "string"
+        },
+        "regularSeasonStartDate": {
+
+                    "target": "regularSeasonStartDate", 
+                    "type": "date"
+        }, 
+        "regularSeasonEndDate": {
+                    "target": "regularSeasonEndDate",
+                    "type": "date"
+        },
+        "preSeasonStartDate": {
+                    "target": "preSeasonStartDate", 
+                    "type": "date"
+        },
+        "playoffEndDate": {
+                    "target": "playoffEndDate", 
+                    "type": "date"
+        },
+        "neutralSite": {
+                    "target": "neutralSite", 
+                    "type": "boolean"
+        }
+}
 
 insert_ready = False
 update_ready = True
@@ -113,28 +175,12 @@ if ready:
         .transform(lambda df: df.select(*[x for x in df.columns if x in base_fields], "gw.*"))
         .withColumn("game_raw", f.explode_outer("games"))
     )
-
+    add_fields_expr = [build_fields(src_col, rule, sched_tmp.columns) for src_col, rule in field_mapping.items()]
     sched_df1 = (
 
         sched_tmp
         .select(*[x for x in sched_tmp.columns if x != "game_raw"], "game_raw.*")
-        .select(
-                "season", 
-                "preSeasonStartDate",
-                "regularSeasonStartDate",
-                "regularSeasonEndDate",
-                "playoffEndDate",
-                f.col("id").alias("game_id"), 
-                f.col("gameType").alias("game_type"), 
-                f.col("date").alias("game_date"), 
-                "easternUTCOffset", 
-                "startTimeUTC", 
-                "venueTimezone", 
-                "venueUTCOffset", 
-                "neutralSite",
-                "awayTeam", 
-                "homeTeam"
-        )
+        .transform(lambda df: df.select(*[build_fields(src_col, rule, df.columns) for src_col, rule in field_mapping.items()], "awayTeam", "homeTeam"))
     )
 
     nested_fields = {
@@ -198,7 +244,9 @@ if ready:
                             f.trim("team_name").alias("team_name"), 
                             f.upper(f.col("home_road")).alias("home_road"), 
                             f.trim("team_city").alias("team_city"), 
-                            "unused_structs", "num_unused_structs", "py_source"
+                            "unused_structs", 
+                            "num_unused_structs", 
+                            "py_source"
                     )
                     .transform(apply_schema, sched_schema)
                     .filter(
@@ -213,7 +261,7 @@ if ready:
 if insert_ready: 
 
     sched_silver.createOrReplaceTempView("schedules_insert_tmp")
-    spark.sql("""
+    spark.sql(f"""
             
             merge into nhl_data_staged.games.schedules t 
             using schedules_insert_tmp s 
@@ -222,20 +270,33 @@ if insert_ready:
                 and t.team_id = s.team_id 
                 and t.home_road = s.home_road 
                 ---not merging on game date in case of a rare circumstance where a game date gets changed, but do want to limit target table to games within the past week
-                and t.game_date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 7) 
-                    and 
-                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
-
+                and (
+                    (
+                        t.game_date between 
+                        date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 
+                        and 
+                        from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                    )
+                    or 
+                    (
+                        from_utc_timestamp(t.insert_dte, '{user_region}')::date between 
+                        date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7)
+                        and 
+                        from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                    )
+                )
             when matched and (
 
                     t.game_date <> s.game_date 
                     or t.game_type <> s.game_type
-                    or not (t.start_time_utc <=> s.start_time_utc)
-                    or not (t.eastern_utc_offset <=> s.eastern_utc_offset)
-                    or not (t.venue_utc_offset <=> s.venue_utc_offset)
-                    or not (t.venue_timezone <=> s.venue_timezone)
-                    or not (t.playoff_end_date <=> s.playoff_end_date)
+                    or coalesce(t.pre_season_start_date, '1900-01-01'::date) <> coalesce(s.pre_season_start_date, t.pre_season_start_date, '1900-01-01'::date)
+                    or coalesce(t.playoff_end_date, '1900-01-01'::date) <> coalesce(s.playoff_end_date, t.playoff_end_date, '1900-01-01'::date)
+                    or coalesce(t.start_time_utc, '0') <> coalesce(s.start_time_utc, t.start_time_utc, '0')
+                    or coalesce(t.eastern_utc_offset, '0') <> coalesce(s.eastern_utc_offset, t.eastern_utc_offset, '0')
+                    or coalesce(t.venue_utc_offset, '0') <> coalesce(s.venue_utc_offset, t.venue_utc_offset, '0')
+                    or coalesce(t.venue_timezone, 'NONE') <> coalesce(s.venue_timezone, t.venue_timezone, 'NONE')
+
+
                 
                 )    
                     
@@ -320,15 +381,9 @@ if insert_ready:
     """)
     #spark.catalog.dropTempView("schedules_insert_tmp")
     print(f"Schedules data successfully loaded into nhl_data_staged.games.schedules table")
+    run_table_maint(spark, "nhl_data_staged.games.schedules")
 else: 
     print(f"No new data to insert into nhl_data_staged.games.schedules, skipping insert")
-if datetime.datetime.today().day % 5 == 0:
-    spark.sql("analyze table nhl_data_staged.games.schedules compute statistics;")
-    spark.sql("optimize nhl_data_staged.games.schedules;")
-    spark.sql("vacuum nhl_data_staged.games.schedules;")
-    spark.sql("analyze table nhl_data.games.schedules compute statistics;")
-    spark.sql("optimize nhl_data.games.schedules;")
-    spark.sql("vacuum nhl_data.games.schedules;")
 
 if update_ready: 
 
@@ -341,23 +396,12 @@ if update_ready:
                 update_dte = current_timestamp()
             where 1 = 1
                 and game_in_play = true 
-                and (
-                    game_date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1) 
-                    or 
-                    insert_dte::date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
-                    )
+                and game_date = date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 1) 
             
-              """)
+    """)
     
-    spark.catalog.dropTempView("schedules_insert_tmp")
     print(f"Games in play field successfully updated in nhl_data_staged.games.pbp_data table")
-else: 
-    print(f"No new data to update in nhl_data_staged.games.pbp_data, skipping update")
 
-if update_ready: 
-
-    #logic below goes in and flags games from the prior day as no longer being in play
-    #this can be done in this script because schedules scrapes are only ran once a day 
     spark.sql(f"""
               
             update nhl_data_staged.games.shift_data 
@@ -365,15 +409,12 @@ if update_ready:
                 update_dte = current_timestamp()
             where 1 = 1
                 and game_in_play = true 
-                and (
-                    game_date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
-                    or 
-                    insert_dte::date = date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 1)
-                    )
+                and game_date = date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 1)
               
-              """)
+    """)
     
     spark.catalog.dropTempView("schedules_insert_tmp")
     print(f"Games in play field successfully updated in nhl_data_staged.games.shift_data table")
+
 else: 
-    print(f"No new data to update in nhl_data_staged.games.shift_data, skipping update")
+    print(f"No new data to update, skipping update")

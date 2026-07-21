@@ -6,7 +6,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as f, types as t 
 from delta.tables import DeltaTable
 from zoneinfo import ZoneInfo
-import requests, json, time, random, threading
+import requests, json, time, random, threading, math
 import datetime as dt
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
@@ -47,14 +47,15 @@ schedules = spark.sql(f"""
                         max(regular_season_start_date)::date as rs_start_date,
                         max(regular_season_end_date)::date as rs_end_date,
                         max(game_date) filter (where game_type = 2)::date as rs_last_game_date,
-                        max(playoff_end_date)::date as playoff_end_date
+                        max(playoff_end_date)::date as playoff_end_date,
+                        (max(regular_season_end_date) >= date_sub(max(game_date) filter (where game_type = 2), 1))::boolean as sched_fully_loaded
                     from nhl_data_staged.games.schedules a 
                     where 1 = 1
                         and a.game_type between 1 and 3        
 
 
-                    """)
-missing_dates = spark.sql("""
+    """)
+missing_dates = spark.sql(f"""
     
                     with dates as (
                     
@@ -69,19 +70,21 @@ missing_dates = spark.sql("""
                     dates_list as (
 
                     ---producing a list of dates starting from the start_date to the end_date, spaced out in 7 day increments per NHL API response
-                        select explode( sequence(start_date, end_date, interval 7 days)) as game_date 
+                        select explode(sequence(start_date, end_date, interval 7 days)) as game_date 
                         from dates 
 
                     )
+                    
                     
                     select 
                         a.game_date 
                     from dates_list a 
                     left anti join nhl_data_raw.games.schedules b
                         on a.game_date = b.request_key
+                    left anti join nhl_data_staged.games.schedules c 
+                        on a.game_date = c.game_date
 
-                    """
-)
+    """)
 ready = True
 missing_ready = not missing_dates.isEmpty()
 
@@ -89,20 +92,17 @@ if ready:
     #today helps get the date in 'America/Chicago' (or whichever region name the user specified in get_utc_region module) formatting so that the date is set properly
     today = today_central()
     schedule_info = (
-    schedules
-    .agg(f.max("ps_start_date").alias("ps_start_date"), 
-        f.max("rs_start_date").alias("rs_start_date"),
-        f.max("rs_end_date").alias("rs_end_date"),
-        f.max("rs_last_game_date").alias("rs_last_game_date"),
-        f.max("playoff_end_date").alias("playoff_end_date")
-        )
-    .first()
+
+            schedules
+            .select("ps_start_date", "rs_start_date", "rs_end_date", "rs_last_game_date", "playoff_end_date", "sched_fully_loaded")
+            .first()
     )
     pre_season_start_date = to_date(schedule_info["ps_start_date"])
     rs_start_date = to_date(schedule_info["rs_start_date"])
     rs_end_date = to_date(schedule_info["rs_end_date"])
     rs_last_game_date = to_date(schedule_info["rs_last_game_date"])
     playoff_end_date = to_date(schedule_info["playoff_end_date"])
+    schedule_fully_loaded = schedule_info["sched_fully_loaded"]
     gap_window = 30
     #pipeline has never been ran and user runs script for the first time
     if rs_end_date is None:
@@ -147,7 +147,7 @@ if ready:
         scrape_plan = "sec_scrape_playoffs_after_rs_end"
     
     #NHL may release a handful of regular season games before releasing full regular season schedule AND prior to releasing pre-season schedule 
-    elif (rs_start_date is not None and today < rs_start_date and pre_season_start_date.year < rs_start_date.year):
+    elif (rs_start_date is not None and today < rs_start_date and pre_season_start_date.year < rs_start_date.year and not schedule_fully_loaded):
 
         start_dt = rs_start_date 
         end_dt = playoff_end_date
@@ -234,8 +234,23 @@ if insert_ready:
     schedules_df = spark.createDataFrame(api_data, schema = schedules_schema)
     if not schedules_df.isEmpty():
         
+        row_sample = max(1, math.ceil(len(api_data) * 0.25))
         schedules_df.createOrReplaceTempView("schedules_insert_tmp")
-        sched_schema = spark.sql("select schema_of_json_agg(payload) as json_schema from schedules_insert_tmp where http_status = 200 and payload is not null").first()["json_schema"]
+        sched_schema = spark.sql(f"""
+                                
+                        with sample_payloads as (
+
+                            select *
+                            from schedules_insert_tmp
+                            tablesample ({row_sample} rows)
+                        
+                        )
+                        select 
+                            schema_of_json_agg(payload) as json_schema 
+                        from schedules_insert_tmp 
+                        where http_status = 200 and payload is not null
+                        
+                    """).first()["json_schema"]
         spark.sql(f"""
                       
                 with src as (
