@@ -51,8 +51,8 @@ schedules = spark.sql(f"""
                         (max(regular_season_end_date) >= date_sub(max(game_date) filter (where game_type = 2), 1))::boolean as sched_fully_loaded
                     from nhl_data_staged.games.schedules a 
                     where 1 = 1
-                        and a.game_type between 1 and 3        
-
+                        and a.game_type between 1 and 3      
+                        and a.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 365)
 
     """)
 missing_dates = spark.sql(f"""
