@@ -126,7 +126,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                         cross join date_param p
                         where 1 = 1
                             and a.request_key is not null
-                            and a.ingest_ts_utc::date < date_sub(p.current_run_date, 2)
+                            and from_utc_timestamp(a.ingest_ts_utc, '{user_region}')::date < date_sub(p.current_run_date, 2)
 
                     )
                     , 
@@ -247,45 +247,6 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     limit {limit_n}
                   
     """)
-
-def flush_api_data(api_data: list) -> int:
-
-    if not api_data:
-        return 0 
-    
-    api_data_df = (
-            spark.createDataFrame(api_data)
-            #.withColumn("game_idx", f.row_number().over(w.partitionBy("request_key").orderBy("request_key")))
-            #.filter(f.col("game_idx") == 1)
-            #.drop("game_idx")
-
-    )
-  
-    merge_insert_found(batch_data = api_data_df)
-    json_schema = (
-
-            api_data_df
-            .selectExpr("schema_of_json_agg(payload) as json_schema")
-            .first()["json_schema"]
-    )
-    missing_payloads = (
-
-            api_data_df 
-            .withColumn("parsed_json", f.from_json(f.col("payload"), json_schema))
-            .filter(
-                    (f.col("parsed_json.total") == 0) 
-                    | (f.size(f.col("parsed_json.data")) == 0)
-            )
-            .drop("parsed_json")
-    )
-    if not missing_payloads.isEmpty():
-        update_missing_games(batch_data = api_data_df)
-    row_cnt = len(api_data)
-
-    api_data.clear()
-    gc.collect()
-
-    return row_cnt
 
 def update_missing_games(batch_data: DataFrame) -> None:
 
@@ -424,6 +385,46 @@ def merge_insert_found(batch_data: DataFrame) -> None:
         print("=" * 100)
     except Exception as e: 
         print(f"Error occured during insert into nhl_data_raw.games.shift_data table: {e}")
+
+def flush_api_data(api_data: list) -> int:
+
+    if not api_data:
+        return 0 
+    
+    api_data_df = (
+            spark.createDataFrame(api_data)
+            #.withColumn("game_idx", f.row_number().over(w.partitionBy("request_key").orderBy("request_key")))
+            #.filter(f.col("game_idx") == 1)
+            #.drop("game_idx")
+
+    )
+  
+    merge_insert_found(batch_data = api_data_df)
+    json_schema = (
+
+            api_data_df
+            .sample(fraction = 0.07, seed = 17)
+            .selectExpr("schema_of_json_agg(payload) as json_schema")
+            .first()["json_schema"]
+    )
+    missing_payloads = (
+
+            api_data_df 
+            .withColumn("parsed_json", f.from_json(f.col("payload"), json_schema))
+            .filter(
+                    (f.col("parsed_json.total") == 0) 
+                    | (f.size(f.col("parsed_json.data")) == 0)
+            )
+            .drop("parsed_json")
+    )
+    if not missing_payloads.isEmpty():
+        update_missing_games(batch_data = api_data_df)
+    row_cnt = len(api_data)
+
+    api_data.clear()
+    gc.collect()
+
+    return row_cnt
 
 kickoff = not get_games(spark, table_name = "nhl_data_raw.games.shift_data").isEmpty()
 kickoff = True

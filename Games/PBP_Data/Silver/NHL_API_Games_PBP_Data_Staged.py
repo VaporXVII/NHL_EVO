@@ -345,7 +345,7 @@ if kickoff:
                             from nhl_data_staged.ops.games_missing_pbp a 
                             cross join date_param p
                             where 1 = 1
-                                --and p.current_run_dte >= a.next_retry_dte
+                                and p.current_run_dte >= a.next_retry_dte
 
                         )
                         ,
