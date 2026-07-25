@@ -4,6 +4,7 @@ sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
 
 from pyspark.sql import SparkSession
 from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint
 
 user_region = region_return()
 spark.sql(f"""
@@ -247,3 +248,4 @@ spark.sql(f"""
     ;
 
 """)
+run_table_maint(spark, "nhl_data.games.pbp_data")

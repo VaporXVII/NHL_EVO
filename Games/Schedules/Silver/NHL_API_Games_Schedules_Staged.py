@@ -71,7 +71,7 @@ sched_raw = spark.sql(f"""
                       
                       with date_param as (
 
-                        select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_date
+                        select from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
                         
                       )
                       
@@ -86,9 +86,9 @@ sched_raw = spark.sql(f"""
                         ---but then the series ends before the game is scheduled))
                         and http_status = 200
                         and (
-                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = current_run_date
+                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = current_run_dte
                             or 
-                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_date, 7) and current_run_date
+                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_dte, 7) and current_run_dte
                             )
                       
     """)

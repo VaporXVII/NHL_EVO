@@ -817,9 +817,7 @@ if shift_insert_ready:
     if not quarantine_insert_ready: 
         spark.catalog.dropTempView("shift_quarantine_tmp")
     print(f"Shift data successfully loaded into nhl_data_staged.games.shift_data table")
-    if datetime.datetime.today().day % 5 == 0:
-        run_table_maint(spark, "nhl_data_staged.games.shift_data")
-        run_table_maint(spark, "nhl_data.games.shift_data")
+    run_table_maint(spark, "nhl_data_staged.games.shift_data")
 
 else: 
     print(f"No new data to insert into nhl_data_staged.games.shift_data, skipping insert")

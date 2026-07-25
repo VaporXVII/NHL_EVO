@@ -11,6 +11,7 @@ import re, json, time, datetime
 from pipeline_funcs.games import get_games
 from pipeline_funcs.schema_utils import convert_case, build_fields, apply_schema, get_schema
 from pipeline_funcs.user_utc_region import region_return
+from pipeline_funcs.table_maint import run_table_maint 
 
 user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
@@ -582,61 +583,61 @@ if ready:
 
         teams = spark.sql("""
                     
-                    select 
+                select 
                         team_id as event_team_id,
                         team_abbrev as event_team_abbrev
-                    from nhl_data_staged.teams.master_ids    
+                from nhl_data_staged.teams.master_ids    
 
         """)
 
         players = spark.sql("""
                                 
-                        select 
-                                player_id, 
-                                player_name, 
-                                player_pos,
-                                shoots_catches, 
-                                team_id, 
-                                team_id_prev_team, 
-                                team_abbrev, 
-                                team_abbrev_prev_team, 
-                                last_active_season
-                        from nhl_data_staged.players.master_ids a 
+                select 
+                        player_id, 
+                        player_name, 
+                        player_pos,
+                        shoots_catches, 
+                        team_id, 
+                        team_id_prev_team, 
+                        team_abbrev, 
+                        team_abbrev_prev_team, 
+                        last_active_season
+                from nhl_data_staged.players.master_ids a 
                                 
                                 
         """)
     
         current_rosters = spark.sql(f"""
                                         
-                        with date_param as (
+                with date_param as (
 
-                                select 
-                                        from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
+                        select 
+                                from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
 
 
-                        )
-                        
-                        select /*+ broadcast (p) */ distinct 
-                                a.season, 
-                                a.game_id, 
-                                b.game_date, 
-                                a.player_id, 
-                                a.jersey_num, 
-                                a.team_id, 
-                                a.headshot, 
-                                a.player_name
-                        from nhl_data_staged.players.player_game_rosters a 
-                        inner join nhl_data_staged.games.schedules b 
-                                on a.season = b.season 
-                                and a.game_id = b.game_id
-                                and a.game_date = b.game_date
-                                and a.team_id = b.team_id
-                        cross join date_param p
-                        where 1 = 1
-                        and from_utc_timestamp(a.insert_dte, '{user_region}')::date between 
-                                date_sub(p.current_run_dte, 1) 
-                                and 
-                                p.current_run_dte
+                )
+                
+                select /*+ broadcast (p) */ 
+                        a.season, 
+                        a.game_id, 
+                        b.game_date, 
+                        a.player_id, 
+                        a.jersey_num, 
+                        a.team_id, 
+                        a.headshot, 
+                        a.player_name
+                from nhl_data_staged.players.player_game_rosters a 
+                inner join nhl_data_staged.games.schedules b 
+                        on a.season = b.season 
+                        and a.game_id = b.game_id
+                        and a.game_date = b.game_date
+                        and a.team_id = b.team_id
+                cross join date_param p
+                where 1 = 1
+                and from_utc_timestamp(a.insert_dte, '{user_region}')::date between 
+                        date_sub(p.current_run_dte, 1) 
+                        and 
+                        p.current_run_dte
                                         
                                         
         """)
@@ -931,8 +932,8 @@ if pbp_insert_ready:
         when matched and (
 
             t.active_row = true 
-            and 
-            (
+            and (
+
                 not (t.game_seconds <=> s.game_seconds) 
                 or not (t.situation_code <=> s.situation_code)
                 or not (t.zone_code <=> s.zone_code)
@@ -950,7 +951,7 @@ if pbp_insert_ready:
         )
 
         then update set 
-            game_date = s.game_date,
+
             period = s.period,
             period_type = s.period_type,
             home_team_defending_side = s.home_team_defending_side,
@@ -1202,14 +1203,8 @@ if pbp_insert_ready:
     if not quarantine_insert_ready: 
         spark.catalog.dropTempView("pbp_quarantine_tmp")
     print(f"Play by Play data successfully loaded into nhl_data_staged.games.pbp_data table")
-    if datetime.datetime.today().day % 5 == 0:
-        spark.sql("""analyze table nhl_data_staged.games.pbp_data compute statistics;""")
-        spark.sql("""optimize nhl_data_staged.games.pbp_data;""")
-        spark.sql("""vacuum nhl_data_staged.games.pbp_data;""")
-        spark.sql("""analyze table nhl_data.games.pbp_data compute statistics;""")
-        spark.sql("""optimize nhl_data.games.pbp_data;""")
-        spark.sql("""vacuum nhl_data.games.pbp_data;""")
-        
+    run_table_maint(spark, "nhl_data_staged.games.pbp_data")
+
 else: 
     print(f"No new data to insert into nhl_data_staged.games.pbp_data, skipping insert")
 
@@ -1346,7 +1341,7 @@ if rosters_insert_ready:
             then update set 
 
                     last_active_season = s.season,
-                    jersey_num = coalesce(s.jersey_num, s.jersey_num),
+                    jersey_num = coalesce(s.jersey_num, t.jersey_num),
                     is_active = true,
                     update_dte = current_timestamp(),
                     py_source = '{py_source}',
@@ -1482,10 +1477,10 @@ if rosters_insert_ready:
             when not matched by source 
                 and t.game_in_play = true 
                 and t.is_active = true 
-                then update set 
-                    t.update_dte = current_timestamp(),
-                    t.is_active = false,
-                    t.py_source = '{py_source}'
+            then update set 
+                t.update_dte = current_timestamp(),
+                t.is_active = false,
+                t.py_source = '{py_source}'
 
     """)
     spark.catalog.dropTempView("rosters_ready_tmp")
