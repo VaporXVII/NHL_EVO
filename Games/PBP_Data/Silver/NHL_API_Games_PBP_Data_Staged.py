@@ -670,6 +670,7 @@ if ready:
                 add_fields_expr = [build_fields(src_col, rule, pbp_raw.columns) for src_col, rule in field_mapping.items()]
                 pbp_staged = (
                                 pbp_raw
+                                .repartition(64, "season", "game_id")
                                 .select(
                                 
                                 "season",
@@ -919,7 +920,7 @@ if pbp_insert_ready:
         )
 
         merge into nhl_data_staged.games.pbp_data t 
-        using pbp_insert_tmp s
+        using src s
             on t.season = s.season
             and t.game_id = s.game_id
             and t.game_date = s.game_date 
@@ -946,6 +947,8 @@ if pbp_insert_ready:
                 or not (t.assist1_player_id <=> s.assist1_player_id)
                 or not (t.assist2_player_id <=> s.assist2_player_id)
                 or not (t.blocking_player_id <=> s.blocking_player_id)
+                or t.x_coord <> coalesce(s.x_coord, t.x_coord)
+                or t.y_coord <> coalesce(s.y_coord, t.y_coord)
 
             )
         )
@@ -1016,7 +1019,9 @@ if pbp_insert_ready:
                                             case when not (t.shooting_player_id <=> s.shooting_player_id) then 'shooting_player_id' end,
                                             case when not (t.assist1_player_id <=> s.assist1_player_id) then 'assist1_player_id' end,
                                             case when not (t.assist2_player_id <=> s.assist2_player_id) then 'assist2_player_id' end,
-                                            case when not (t.blocking_player_id <=> s.blocking_player_id) then 'blocking_player_id' end
+                                            case when not (t.blocking_player_id <=> s.blocking_player_id) then 'blocking_player_id' end,
+                                            case when not (t.x_coord <=> coalesce(s.x_coord, t.x_coord)) then 'x_coord' end,
+                                            case when not (t.y_coord <=> coalesce(s.y_coord, t.y_coord)) then 'y_coord' end
                                         )
                                         , x -> x is not null
                                     )
@@ -1333,8 +1338,8 @@ if rosters_insert_ready:
 
             when matched and (
 
-                    coalesce(t.last_active_season, 19001901) <> s.last_active_season 
-                    or coalesce(t.jersey_num, 999) <> coalesce(s.jersey_num, 999)
+                    coalesce(t.last_active_season, 19001901) <> coalesce(s.last_active_season, t.last_active_season, 19001901) 
+                    or coalesce(t.jersey_num, 999) <> coalesce(s.jersey_num, t.jersey_num, 999)
 
             )
 
@@ -1350,8 +1355,8 @@ if rosters_insert_ready:
                                         ', '
                                         , filter(
                                             array(
-                                                case when not (t.last_active_season <=> s.last_active_season) then 'last_active_season' end
-                                                , case when not (t.jersey_num <=> s.jersey_num) then 'jersey_num' end
+                                                case when not (t.last_active_season <=> s.last_active_season) then 'last_active_season' end,
+                                                case when not (t.jersey_num <=> s.jersey_num) then 'jersey_num' end
                                             )
                                             , x -> x is not null
                                         )
