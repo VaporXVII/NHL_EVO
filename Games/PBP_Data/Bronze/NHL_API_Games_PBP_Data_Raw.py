@@ -462,7 +462,7 @@ if kickoff:
             break 
         buckets = {row["which_game"] for row in games.select("which_game").distinct().collect()}
         final_pass = (
-            buckets.issubset({"in play", "last_two", "ended today", "missing pbp data"})
+            buckets.issubset({"in play", "last two", "ended today", "missing pbp data"})
             and game_count < batch_size
         )
     
