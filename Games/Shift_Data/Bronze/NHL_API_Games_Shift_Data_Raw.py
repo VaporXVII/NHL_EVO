@@ -441,7 +441,7 @@ if kickoff:
     print("=" * 50)
     batch_size = 100
     max_loops = 75
-    api_data, missing_games = [], [] 
+    api_data = []
     seen_keys = set()
     n = 0
     memory_limit_pct = 80
@@ -461,7 +461,7 @@ if kickoff:
     shift_schema = spark.sql("select schema_of_json_agg(payload) as json_schema from nhl_data_raw.games.shift_data where http_status = 200 and payload is not null").first()["json_schema"]
     while True: 
         
-        if n > max_loops:
+        if n >= max_loops:
             break
         games = find_games(limit_n = batch_size, raw_schema = shift_schema)
         game_count = games.count()
@@ -489,9 +489,6 @@ if kickoff:
                 if request_key not in seen_keys:
                     api_data.append(row)
                     seen_keys.add(request_key)
-
-                if row["http_status"] != 200:
-                    missing_games.append(row)
 
                 if memory_check(api_data = api_data, memory_limit_pct = memory_limit_pct):
                     print(f"Memory threshold hit at {driver_mem_pct()}%, clearing memory")

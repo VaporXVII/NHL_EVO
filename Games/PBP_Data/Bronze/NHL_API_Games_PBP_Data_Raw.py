@@ -433,7 +433,7 @@ if kickoff:
     print("=" * 50)
     batch_size = 500
     max_loops = 75
-    api_data, missing_games = [], [] 
+    api_data []
     seen_keys = set()
     n = 0
     memory_limit_pct = 80
@@ -481,9 +481,6 @@ if kickoff:
                 if request_key not in seen_keys:
                     api_data.append(row)
                     seen_keys.add(request_key)
-
-                if row["http_status"] != 200:
-                    missing_games.append(row)
 
                 if memory_check(api_data = api_data, memory_limit_pct = memory_limit_pct):
                     print(f"Memory threshold hit at {driver_mem_pct()}%, clearing memory")
