@@ -265,7 +265,7 @@ def update_missing_games(batch_data, DataFrame) -> None:
 
                 )
                 
-                merge into nhl_data_staged.games.games_missing_pbp t 
+                merge into nhl_data_staged.ops.games_missing_pbp t 
                 using src s 
                     on t.season = s.season 
                     and t.game_id = s.game_id 
