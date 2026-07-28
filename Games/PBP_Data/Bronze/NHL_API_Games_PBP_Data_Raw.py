@@ -304,10 +304,10 @@ def update_missing_games(batch_data, DataFrame) -> None:
         
         """)
         spark.catalog.dropTempView("pbp_data_missing_tmp")
-        print("Batch successfully inserted into nhl_data_staged.ops.pbp_missing_shift table")
+        print("Batch successfully inserted into nhl_data_staged.ops.games_missing_pbp table")
         print("=" * 100)
     except Exception as e: 
-        print(f"Error occured during insert into nhl_data_staged.ops.pbp_missing_shift table: {e}")
+        print(f"Error occured during insert into nhl_data_staged.ops.games_missing_pbp table: {e}")
 
 def merge_insert_found(batch_data: DataFrame) -> None:
 
