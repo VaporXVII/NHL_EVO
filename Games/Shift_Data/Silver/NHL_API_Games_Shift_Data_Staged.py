@@ -219,6 +219,7 @@ if kickoff:
                 select 
                     from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte,
                     current_timestamp() as current_run_time
+    
 
 
             ) 
@@ -484,20 +485,19 @@ if ready:
     py_source = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get().split("/")[-1]
     players = spark.sql("""
                      
-                    select 
-                        player_id, 
-                        player_name,
-                        player_pos,
-                        shoots_catches
-                    from nhl_data_staged.players.master_ids a 
-                    where 1 = 1
+            select 
+                player_id, 
+                player_name,
+                player_pos,
+                shoots_catches
+            from nhl_data_staged.players.master_ids a 
+            where 1 = 1
                      
-                     """)
+    """)
     shift_schema = get_schema(games)
     shifts_raw = (
 
         games
-        .orderBy(f.col("game_date").desc())
         .withColumn("json", f.from_json("payload", shift_schema))
         .select("game_date", "game_in_play", "json.*")
         .select("game_date", "game_in_play", f.explode(f.col("data")).alias("data"))
@@ -517,7 +517,8 @@ if ready:
         .withColumn("season", 
                         (f.concat(
                         f.substring(f.col("game_id").cast("string"), 1, 4), 
-                        f.substring(f.col("game_id").cast("string"), 1, 4).cast("integer") + f.lit(1)).cast("string")
+                        f.substring(f.col("game_id").cast("string"), 1, 4).cast("integer") + f.lit(1)
+                        ).cast("string")
                         ).cast("integer")
 
         )
@@ -577,7 +578,14 @@ if ready:
     rosters_data = (
 
             shifts_data 
-            .select("season", "game_id", "team_id", "team_abbrev", "player_id", "player_name", "player_pos", 
+            .select(
+                    "season", 
+                    "game_id", 
+                    "team_id", 
+                    "team_abbrev", 
+                    "player_id", 
+                    "player_name", 
+                    "player_pos", 
                     f.lit(None).alias("jersey_num"), 
                     "shoots_catches", 
                     f.lit(None).alias("birth_dte"),
@@ -586,7 +594,7 @@ if ready:
                     "game_in_play", 
                     "py_source"
                     
-                    )
+            )
             .dropDuplicates(["season", "player_id", "game_id"])
         
     )
@@ -609,10 +617,11 @@ if ready:
                             & (f.col("end_time").isNotNull())
                             
                             )
+                    .repartition(64, "season", "game_id")
 
     )
     shift_insert_ready = not shifts_data.isEmpty()
-    rosters_ready_insert = not rosters_data.isEmpty()
+    rosters_ready_insert = True
     quarantine_insert_ready = not quarantine.isEmpty()
 
 if shift_insert_ready:
@@ -623,7 +632,7 @@ if shift_insert_ready:
               
             with src as (
 
-                select /*+ broadcast (t) */
+                select /*+ broadcast (t), broadcast (q) */
                     s.season, 
                     s.game_id,
                     s.game_date,
@@ -854,7 +863,7 @@ if rosters_ready_insert:
                 t.player_name <> s.player_name 
                 or not (t.player_pos <=> s.player_pos) 
                 or not (t.jersey_num <=> s.jersey_num)
-                or t.game_in_play <> s.game_in_play
+                or coalesce(t.game_in_play, false) <> coalesce(s.game_in_play, t.game_in_play, false)
                 )
             
             )
@@ -863,7 +872,7 @@ if rosters_ready_insert:
 
                 season = s.season,
                 player_name = s.player_name, 
-                player_pos = s.player_pos, 
+                player_pos = coalesce(s.player_pos, t.player_pos), 
                 shoots_catches = coalesce(s.shoots_catches, t.shoots_catches), 
                 is_active = true, 
                 game_in_play = s.game_in_play,
