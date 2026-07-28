@@ -453,7 +453,7 @@ if kickoff:
     pbp_schema = spark.sql("""select schema_of_json_agg(payload) as json_schema from nhl_data_raw.games.pbp_data where payload is not null and http_status = 200""").first()["json_schema"]
     while True: 
 
-        if n > max_loops: 
+        if n >= max_loops: 
             break 
         games = find_games(limit_n = batch_size, raw_schema = pbp_schema)
         game_count = games.count()
