@@ -1,6 +1,6 @@
 # Overview
 
-The purpose of this project is to build NHL_EVO, a scalable ELT pipeline that consistently ingests data from the NHL API and loads it into Databricks Delta Lake tables using the Medallion Architecture (Bronze, Silver, and Gold), while 
+The purpose of this project is to build NHL EVO, a scalable ELT pipeline that consistently ingests data from the NHL API and loads it into Databricks Delta Lake tables using the Medallion Architecture (Bronze, Silver, and Gold), while 
 also incorporating other data engineering concepts to ensure accuracy and reliability, such as: 
 
 - incremental and late-arrival data processing
