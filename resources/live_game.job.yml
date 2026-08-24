@@ -1,0 +1,105 @@
+resources:
+  jobs:
+    NHL_EVO_Live_Game_Data:
+      name: NHL_EVO_Live_Game_Data
+
+      email_notifications:
+        on_success:
+          - ${workspace.current_user.userName}
+        on_failure:
+          - ${workspace.current_user.userName}
+
+      queue:
+        enabled: true
+
+      schedule:
+        quartz_cron_expression: "0 0,30 18-23 * * ?"
+        timezone_id: America/Chicago
+        pause_status: PAUSED
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+            dependencies: []
+
+      tasks:
+        - task_key: games_today_check
+          spark_python_task:
+            python_file: ../Pipeline_Logic/NHL_Data_Pipeline_Games_Check.py
+          environment_key: default
+
+        - task_key: games_today_kickoff
+          depends_on:
+            - task_key: games_today_check
+          condition_task:
+            op: GREATER_THAN
+            left: "{{tasks.games_today_check.values.games_today}}"
+            right: "0"
+
+        - task_key: pbp_data_raw
+          depends_on:
+            - task_key: games_today_kickoff
+              outcome: "true"
+          spark_python_task:
+            python_file: ../Games/PBP_Data/NHL_API_Games_PBP_Data_Raw.py
+          environment_key: default
+
+        - task_key: no_games_today_skip
+          depends_on:
+            - task_key: games_today_kickoff
+              outcome: "false"
+          spark_python_task:
+            python_file: ../Pipeline_Logic/NHL_Data_Pipeline_Skip_Run.py
+          environment_key: default
+
+        - task_key: pbp_data_staged
+          depends_on:
+            - task_key: pbp_data_raw
+          spark_python_task:
+            python_file: ../Games/PBP_Data/NHL_API_Games_PBP_Data_Staged.py
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+
+        - task_key: pbp_data
+          depends_on:
+            - task_key: pbp_data_staged
+          spark_python_task:
+            python_file: ../Games/PBP_Data/NHL_API_Games_PBP_Data.py
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+
+        - task_key: shift_data_raw
+          depends_on:
+            - task_key: pbp_data
+          spark_python_task:
+            python_file: ../Games/Shift_Data/NHL_API_Games_Shift_Data_Raw.py
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+
+        - task_key: shift_data_staged
+          depends_on:
+            - task_key: shift_data_raw
+          spark_python_task:
+            python_file: ../Games/Shift_Data/NHL_API_Games_Shift_Data_Staged.py
+          environment_key: default
+          max_retries: 2
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+
+        - task_key: shift_data
+          depends_on:
+            - task_key: shift_data_staged
+          spark_python_task:
+            python_file: ../Games/Shift_Data/NHL_API_Games_Shift_Data.py
+          environment_key: default
