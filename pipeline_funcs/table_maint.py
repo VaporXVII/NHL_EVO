@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession 
 
-def run_table_maint(table_name: str) -> None:
+def run_table_maint(spark: SparkSession, table_name: str) -> None:
 
     print("=" * 50)
     print(f"Analyzing {table_name}")
