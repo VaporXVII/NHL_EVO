@@ -213,7 +213,7 @@ if kickoff:
         """)
         print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_shift table")
     else: 
-        print(f"Skipping insert since current season game date is not eligble")
+        print(f"Skipping insert since current season game date is not eligble for retry")
 else: 
     print(f"No new data found, skipping insert")
 
