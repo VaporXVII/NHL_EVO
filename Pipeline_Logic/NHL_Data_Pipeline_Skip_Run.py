@@ -1,1 +1,1 @@
-dbutils.notebook.exit("No games today. Pipeline skipped.")
+print("No games today. Pipeline skipped.")

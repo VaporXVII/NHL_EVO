@@ -1,6 +1,13 @@
-import sys 
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+import sys
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
@@ -433,7 +440,7 @@ if kickoff:
     print("=" * 50)
     batch_size = 500
     max_loops = 75
-    api_data []
+    api_data = []
     seen_keys = set()
     n = 0
     memory_limit_pct = 80

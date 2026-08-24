@@ -1,6 +1,13 @@
-import sys 
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+import sys
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
@@ -435,7 +442,6 @@ def flush_api_data(api_data: list) -> int:
     return row_cnt
 
 kickoff = not get_games(spark, table_name = "nhl_data_raw.games.shift_data").isEmpty()
-kickoff = True
 if kickoff:
     print(f"Starting batch scrape process...")
     print("=" * 50)
@@ -502,3 +508,8 @@ if kickoff:
             break 
     print("=" * 50)
     print(f"Done, total rows written = {rows_written_total:,}") if rows_written_total > 0 else print("Done")
+
+
+
+
+

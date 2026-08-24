@@ -1,6 +1,13 @@
 import sys
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
 
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
@@ -210,6 +217,7 @@ if kickoff:
 else: 
     print(f"No new data found, skipping insert")
 
+ready = False
 if kickoff: 
     games = spark.sql(f"""
                     
@@ -247,7 +255,10 @@ if kickoff:
                     c.cold_start_ind,
                     ---check to see if current timestamp is at least 25 minutes after the game's scheduled start time
                     ---using 25 minute delay from start time because shift data takes a little while longer to populate compared to PBP data 
-                    (a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 25 minutes)::boolean as game_in_play_ind,
+                    (
+                    a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 25 minutes or 
+                    b.game_id is not null
+                    )::boolean as game_in_play_ind,
                     ---check to see if the game was played in the prior two days
                     (a.game_date between date_sub(p.current_run_dte, 2) and date_sub(p.current_run_dte, 1))::boolean as game_prior_two_ind,
                     ---check to see if the game is part of the games_missing_shift table and is eligible for retry on the current date
@@ -297,7 +308,8 @@ if kickoff:
                     a.season,
                     a.game_id,
                     a.game_date,
-                    a.start_time_utc
+                    a.start_time_utc,
+                    a.game_in_play_ind
                 from games a  
                 inner join pbp_game_status b
                     on a.game_id = b.game_id
@@ -319,7 +331,8 @@ if kickoff:
                     a.season,
                     a.game_id,
                     a.game_date,
-                    a.start_time_utc 
+                    a.start_time_utc,
+                    a.game_in_play_ind
                 from games a 
                 left anti join games_ended_today b 
                     on a.season = b.season 
@@ -338,7 +351,8 @@ if kickoff:
                     a.season,
                     a.game_id,
                     a.game_date,
-                    a.start_time_utc
+                    a.start_time_utc,
+                    a.game_in_play_ind
                 from games a 
                 where 1 = 1
                     and a.cold_start_ind = false 
@@ -355,7 +369,8 @@ if kickoff:
                     season,
                     game_id,
                     game_date,
-                    start_time_utc
+                    start_time_utc,
+                    game_in_play_ind
                 from games_in_play 
                 union all 
                 select 
@@ -363,7 +378,8 @@ if kickoff:
                     season,
                     game_id,
                     game_date,
-                    start_time_utc
+                    start_time_utc,
+                    game_in_play_ind 
                 from games_ended_today 
                 union all 
                 select 
@@ -371,7 +387,8 @@ if kickoff:
                     season,
                     game_id,
                     game_date,
-                    start_time_utc
+                    start_time_utc,
+                    game_in_play_ind 
                 from games_prior_two 
                 union all 
                 select 
@@ -379,7 +396,8 @@ if kickoff:
                     season,
                     game_id,
                     game_date,
-                    start_time_utc
+                    start_time_utc,
+                    game_in_play_ind 
                 from games a 
                 where 1 = 1 
                     and cold_start_ind = false 
@@ -390,7 +408,8 @@ if kickoff:
                     season,
                     game_id,
                     game_date,
-                    start_time_utc
+                    start_time_utc,
+                    game_in_play_ind
                 from games a  
                 cross join date_param p
                 where 1 = 1
@@ -425,6 +444,7 @@ if kickoff:
                 a.game_id,
                 a.game_date,
                 a.start_time_utc,
+                if(a.which_game = "missing shift data", false, a.game_in_play_ind) as game_in_play,
                 b.payload,
                 date_format(from_utc_timestamp(a.start_time_utc, '{user_region}'), 'hh:mm a') as game_start_time_cst
             from final_games a
@@ -581,6 +601,7 @@ if ready:
             .select(
                     "season", 
                     "game_id", 
+                    "game_date",
                     "team_id", 
                     "team_abbrev", 
                     "player_id", 
@@ -1030,3 +1051,5 @@ if quarantine_insert_ready:
     print(f"Shift data successfully loaded into nhl_data_staged.quarantine.shift_data table")
 else: 
     print(f"No new data to insert into nhl_data_staged.quarantine.shift_data, skipping insert")
+
+
