@@ -25,10 +25,11 @@ user_region = region_return()
 spark = SparkSession.builder.getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 
-def find_games(limit_n: int, raw_schema: str = None) -> DataFrame: 
+def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame: 
 
     #SQL below is used as part of batch processing. Since pbp data is the second largest data set from the NHL API, 
     #attempting to collect data for all games, without doing batch processing, can cause the Serverless compute cluster to run out of memory
+    limit_clause = f"limit {limit_n}" if limit_n is not None else ""
     return spark.sql(f"""
                          
             
@@ -45,9 +46,13 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
 
                     ---check to see if any rows have been inserted into nhl_data_staged.games.pbp_data table, if none exist then set cold_start_ind = true
                     ---using where to filter table down to avoid excess scanning
-                    select distinct 
+                    select  
                         request_key as game_id
-                    from nhl_data_raw.games.pbp_data
+                    from nhl_data_raw.games.pbp_data a 
+                    cross join date_param b
+                    where 1 = 1
+                        and payload is not null 
+                        and ingest_ts_utc::date >= date_sub(current_run_dte, 150)
 
                 )
                 , 
@@ -59,19 +64,25 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                         a.game_id,
                         a.game_date,
                         a.start_time_utc,
-                        (c.game_id is null
+                        (
+                            c.game_id is null and b.game_id is null 
                             and (
-                                a.game_date < p.current_run_dte
-                                or 
-                                (a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes)
+                                a.game_date < p.current_run_dte 
+                                or (
+                                    a.game_date = p.current_run_dte
+                                    and from_utc_timestamp(p.current_run_time, '{user_region}') >= timestampadd(minute, 15, from_utc_timestamp(a.start_time_utc, '{user_region}'))
                                 )
-                        )::boolean as cold_start_ind,
+
+                            )
+
+                            )::boolean as cold_start_ind,
                         ---check to see if current timestamp is at least 15 minutes after the game's scheduled start time
-                        (a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 15 minutes)::boolean as game_in_play_ind,
+                        (a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= timestampadd(minute, 15, from_utc_timestamp(a.start_time_utc, '{user_region}')))::boolean as game_in_play_ind,
                         ---check to see if the game was played in the prior two days
                         (a.game_date between date_sub(p.current_run_dte, 2) and date_sub(p.current_run_dte, 1))::boolean as game_prior_two_ind,
                         ---check to see if the game is in part of the games_missing_pbp table and is eligible for retry on the current date
-                        (b.game_id is not null)::boolean as missing_game_ind,
+                        (b.game_id is not null)::boolean as known_missing_ind,
+                        (b.game_id is not null and p.current_run_dte >= b.next_retry_dte)::boolean as missing_game_ind,
                         b.next_retry_dte
                     from nhl_data_staged.games.schedules a
                     cross join date_param p 
@@ -80,7 +91,6 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     left join nhl_data_staged.ops.games_missing_pbp b 
                         on a.season = b.season 
                         and a.game_id = b.game_id 
-                        and p.current_run_dte >= b.next_retry_dte
                     where 1 = 1
                         and a.game_type in (2,3)
                         and lower(a.home_road) = 'home'
@@ -131,6 +141,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                         and a.game_date = p.current_run_dte
                         and a.cold_start_ind = false
                         and a.missing_game_ind = false 
+                        and a.known_missing_ind = false 
 
 
                 )
@@ -152,6 +163,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     where 1 = 1
                         and a.cold_start_ind = false
                         and a.missing_game_ind = false 
+                        and a.known_missing_ind = false 
                         and a.game_in_play_ind = true
                         
 
@@ -170,6 +182,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     where 1 = 1
                         and a.cold_start_ind = false 
                         and a.missing_game_ind = false 
+                        and a.known_missing_ind = false
                         and a.game_prior_two_ind = true
 
                 )
@@ -210,6 +223,7 @@ def find_games(limit_n: int, raw_schema: str = None) -> DataFrame:
                     where 1 = 1
                         and cold_start_ind = false
                         and missing_game_ind = true 
+                        and known_missing_ind = true 
                     union all
                     select /*+ broadcast (p) */
                         "cold start" as which_game,
@@ -293,6 +307,7 @@ def update_missing_games(batch_data: DataFrame) -> None:
                     attempt_count,
                     insert_dte,
                     update_dte
+                    
                 )
 
                 values (
@@ -339,7 +354,8 @@ def merge_insert_found(batch_data: DataFrame) -> None:
                 merge into nhl_data_raw.games.pbp_data t 
                 using src s
                     on t.request_key = s.request_key
-                when matched and 
+                when matched and (
+
                     t.payload <> s.payload 
                     and t.http_status = 200
                     ---setting hard rule so that it doesn't override data from a previous scrape with a blank payload 
@@ -347,7 +363,8 @@ def merge_insert_found(batch_data: DataFrame) -> None:
                     and s.empty_condition_one = false 
                     and s.empty_condition_two = false
  
-
+                )
+                
                 then update set 
                     payload = s.payload,
                     update_ts_utc = current_timestamp()
@@ -391,9 +408,9 @@ def flush_api_data(api_data: list) -> int:
         
         #take sample of payload schemas
         json_schema = (
-
+                
+                #since batches are limited to 100 games regardless of number of games in play that day, using schema_of_json_agg to determine what pbp schema is
                 api_data_df
-                .sample(fraction = 0.07, seed = 17)
                 .selectExpr("schema_of_json_agg(payload) as json_schema")
                 .first()["json_schema"]
         )
@@ -435,69 +452,101 @@ def flush_api_data(api_data: list) -> int:
     return row_cnt
 
 kickoff = not get_games(spark, table_name = "nhl_data_raw.games.pbp_data").isEmpty()
-if kickoff:
-    print(f"Starting batch scrape process...")
+if kickoff: 
+    print("Starting batch scrape process...")
     print("=" * 50)
-    batch_size = 500
-    max_loops = 75
+    batch_size = 100
+    eligible_count = find_games(limit_n = 10_000_000).count()
+    # One additional loop confirms that no eligible games remain.
+    max_loops = math.ceil(eligible_count / batch_size) + 1
     api_data = []
     seen_keys = set()
+    previous_game_ids = None
     n = 0
     memory_limit_pct = 80
     rows_written_total = 0
+
     rate_limiter = RateLim(
-                        rps = 2.0,
-                        min_rps = 1.0,
-                        max_rps = 5.0,
-                        step_up = 0.5,
-                        step_down = 1.0,
-                        eval_every = 50,
-                        window_size = 50,
-                        max_error_rate = 0.05,
-                        max_429_rate = 0.02
+        rps = 2.0,
+        min_rps = 1.0,
+        max_rps = 5.0,
+        step_up = 0.5,
+        step_down = 1.0,
+        eval_every = 50,
+        window_size = 50,
+        max_error_rate = 0.05,
+        max_429_rate = 0.02
     )
-    rows_written_total = 0 
-    pbp_schema = spark.sql("""select schema_of_json_agg(payload) as json_schema from nhl_data_raw.games.pbp_data where payload is not null and http_status = 200""").first()["json_schema"]
-    while True: 
 
-        if n >= max_loops: 
-            break 
-        games = find_games(limit_n = batch_size, raw_schema = pbp_schema)
-        game_count = games.count()
-        if games.isEmpty():
-            print(f"No eligible games found, skipping scrape...")
-            break 
-        buckets = {row["which_game"] for row in games.select("which_game").distinct().collect()}
-        final_pass = (
-            buckets.issubset({"in play", "last two", "ended today", "missing pbp data"})
-            and game_count < batch_size
-        )
-    
-        pbp_data_urls = games.select("api_url").collect()
-        total_games = len(pbp_data_urls)
-        n_batches = math.ceil(total_games / batch_size)
-
-        for batch_num, batch_rows in enumerate(chunk_list(pbp_data_urls, batch_size), start = 1):
-            print(f"Starting batch {n} of {max_loops}...")
-            urls = [row["api_url"] for row in batch_rows]
-            batch_results = scrape_batch(urls = urls, endpoint = "pbp_data")
+    pbp_schema = spark.sql(f"""
+                             
+        select 
+            schema_of_json_agg(payload) as json_schema
+        from nhl_data_raw.games.pbp_data
+        where 1 = 1
+            and http_status = 200
+            and payload is not null
+            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= date_sub(current_date(), 365)
             
+    """).first()["json_schema"]
+
+    while n < max_loops:
+
+        games = find_games(limit_n = batch_size, raw_schema = pbp_schema)
+
+        # Collect the small batch once instead of running count(), isEmpty(), and multiple collect() operations.
+        game_rows = (
+            
+            games
+            .select(
+            "game_id",
+            "which_game",
+            "api_url"
+            )
+
+        ).collect()
+
+        game_count = len(game_rows)
+        if game_count == 0:
+            print("No eligible games found, skipping scrape...")
+            break
+        buckets = {row["which_game"] for row in game_rows}
+        current_game_ids = {row["game_id"] for row in game_rows}
+
+        # Prevent the same batch from being scraped repeatedly when find_games() fails to make progress.
+        if current_game_ids == previous_game_ids:
+            raise RuntimeError("No progress detected: find_games returned the same batch twice")
+            
+        previous_game_ids = current_game_ids
+
+        final_pass = ("cold start" not in buckets and "missing pbp data" not in buckets and game_count < batch_size)
+        pbp_data_urls = [row["api_url"] for row in game_rows]
+        print(f"Starting batch {n + 1} of {max_loops} " f"({game_count:,} games)...")
+
+        for urls in chunk_list(pbp_data_urls, batch_size):
+
+            batch_results = scrape_batch(urls = list(urls), endpoint = "pbp", push_to_s3 = True)
             for row in batch_results:
-                
+
                 request_key = row["request_key"]
+
                 if request_key not in seen_keys:
                     api_data.append(row)
                     seen_keys.add(request_key)
 
                 if memory_check(api_data = api_data, memory_limit_pct = memory_limit_pct):
-                    print(f"Memory threshold hit at {driver_mem_pct()}%, clearing memory")
+                    print(f"Memory threshold hit at " f"{driver_mem_pct()}%, clearing memory")
                     rows_written_total += flush_api_data(api_data = api_data)
+
             if api_data:
-                rows_written_total += flush_api_data(api_data = api_data)
-                seen_keys.clear()
+               rows_written_total += flush_api_data(api_data = api_data)
+
+            seen_keys.clear()
+
         n += 1
 
-        if final_pass: 
-            break 
+        if final_pass:
+            break
+
     print("=" * 50)
-    print(f"Done, total rows written = {rows_written_total:,}") if rows_written_total > 0 else print(f"Done")
+    print(f"Done, total rows written = {rows_written_total:,}" if rows_written_total > 0 else "Done")
