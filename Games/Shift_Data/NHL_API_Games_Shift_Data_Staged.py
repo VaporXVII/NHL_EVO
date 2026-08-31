@@ -35,13 +35,12 @@ if kickoff:
                 with src as (
                     
                     select distinct 
-                        b.season,
-                        b.game_id
+                        a.season,
+                        a.game_id
                     from nhl_data_staged.ops.games_missing_shift a 
-                    inner join nhl_data_staged.games.shift_data b
+                    left semi join nhl_data_staged.games.shift_data b
                         on a.season = b.season
                         and a.game_id = b.game_id
-                    where 1 = 1
                         
 
                 )
@@ -71,17 +70,17 @@ if kickoff:
         ,
         current_season_dates as (
 
-                select /*+ broadcast (p) */ distinct
-                    a.season, 
-                    a.game_date,
-                    (p.shift_table_season = 19001901) as cold_start_ind
-                from nhl_data_staged.games.schedules a 
-                cross join season_param p 
-                where 1 = 1
-                    and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                    and a.game_type in (2,3)
-                    and lower(a.home_road) = 'home'
-                qualify a.season = max(a.season) over()
+            select /*+ broadcast (p) */ distinct
+                a.season, 
+                a.game_date,
+                (p.shift_table_season = 19001901) as cold_start_ind
+            from nhl_data_staged.games.schedules a 
+            cross join season_param p 
+            where 1 = 1
+                and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                and a.game_type in (2,3)
+                and lower(a.home_road) = 'home'
+            qualify a.season = max(a.season) over()
         )
         , 
         current_season_dates_idx as (
@@ -102,31 +101,34 @@ if kickoff:
     
     """)
     run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
-    shift_schema = spark.sql(f"""
-                             
-                        with schema_data as (
-
-                            select payload 
-                            from nhl_data_raw.games.shift_data 
-                            where 1 = 1
-                                and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
-                                and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                            order by rand()
-                        )
-                        ,
-                        schema_sample as (
-
-                            select payload 
-                            from schema_data 
-                            tablesample (10 rows)
-
-                        )
-
-                        select schema_of_json_agg(payload) as json_schema
-                        from schema_sample                      
-                            
-    """).first()["json_schema"]
     if run_missing_ind: 
+
+        shift_schema = spark.sql(f"""
+                             
+                with schema_data as (
+
+                    select payload 
+                    from nhl_data_raw.games.shift_data 
+                    where 1 = 1
+                        and payload is not null 
+                        and http_status = 200 
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                    order by rand()
+                )
+                ,
+                schema_sample as (
+
+                    select payload 
+                    from schema_data 
+                    tablesample (10 rows)
+
+                )
+
+                select schema_of_json_agg(payload) as json_schema
+                from schema_sample                      
+                            
+            """).first()["json_schema"]
 
         spark.sql(f"""
                 
@@ -148,7 +150,7 @@ if kickoff:
                         ---for unknown reasons
                         and a.game_date < from_utc_timestamp(current_timestamp(), '{user_region}')::date
                         and a.game_type in (2,3)
-                        and a.season >= 20102011
+                        and a.season > 20092010
 
                 )
                 ,
@@ -213,7 +215,7 @@ if kickoff:
         """)
         print(f"Data successfully inserted/update into nhl_data_staged.ops.games_missing_shift table")
     else: 
-        print(f"Skipping insert since current season game date is not eligble for retry")
+        print(f"Skipping insert since current season game date is not eligble")
 else: 
     print(f"No new data found, skipping insert")
 
@@ -256,21 +258,21 @@ if kickoff:
                     ---check to see if current timestamp is at least 25 minutes after the game's scheduled start time
                     ---using 25 minute delay from start time because shift data takes a little while longer to populate compared to PBP data 
                     (
-                    a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 25 minutes or 
-                    b.game_id is not null
+                    (a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= from_utc_timestamp(a.start_time_utc, '{user_region}') + interval 25 minutes) 
+                    or b.game_id is not null
                     )::boolean as game_in_play_ind,
                     ---check to see if the game was played in the prior two days
                     (a.game_date between date_sub(p.current_run_dte, 2) and date_sub(p.current_run_dte, 1))::boolean as game_prior_two_ind,
                     ---check to see if the game is part of the games_missing_shift table and is eligible for retry on the current date
-                    (b.game_id is not null)::boolean as missing_game_ind,
+                    (b.game_id is not null)::boolean as known_missing_ind,
+                    (b.game_id is not null and p.current_run_dte >= b.next_retry_dte)::boolean as missing_game_ind,
                     b.next_retry_dte
                 from nhl_data_staged.games.schedules a
                 cross join date_param p
                 cross join cold_start_check c 
                 left join nhl_data_staged.ops.games_missing_shift b 
                     on a.season = b.season 
-                    and a.game_id = b.game_id 
-                    and p.current_run_dte >= b.next_retry_dte
+                    and a.game_id = b.game_id
                 where 1 = 1
                     and a.season >= 20102011
                     and a.game_type in (2,3)
@@ -319,7 +321,8 @@ if kickoff:
                 where 1 = 1
                     and a.game_date = p.current_run_dte
                     and a.cold_start_ind = false 
-                    and a.missing_game_ind = false 
+                    and a.missing_game_ind = false
+                    and a.known_missing_ind = false 
                     
             )
             ,
@@ -340,8 +343,9 @@ if kickoff:
                     and a.game_date = b.game_date 
                 where 1 = 1
                     and a.cold_start_ind = false 
-                    and a.missing_game_ind = false 
-                    and a.game_in_play_ind = true 
+                    and a.missing_game_ind = false
+                    and a.known_missing_ind = false  
+                    and a.game_in_play_ind = true
                     
             )
             ,
@@ -357,6 +361,7 @@ if kickoff:
                 where 1 = 1
                     and a.cold_start_ind = false 
                     and a.missing_game_ind = false
+                    and a.known_missing_ind = false
                     and a.game_prior_two_ind = true  
                     
             )
@@ -379,7 +384,7 @@ if kickoff:
                     game_id,
                     game_date,
                     start_time_utc,
-                    game_in_play_ind 
+                    game_in_play_ind
                 from games_ended_today 
                 union all 
                 select 
@@ -388,7 +393,7 @@ if kickoff:
                     game_id,
                     game_date,
                     start_time_utc,
-                    game_in_play_ind 
+                    game_in_play_ind
                 from games_prior_two 
                 union all 
                 select 
@@ -397,11 +402,12 @@ if kickoff:
                     game_id,
                     game_date,
                     start_time_utc,
-                    game_in_play_ind 
-                from games a 
+                    game_in_play_ind
+                from games
                 where 1 = 1 
                     and cold_start_ind = false 
                     and missing_game_ind = true 
+                    and known_missing_ind = true
                 union all 
                 select /*+ broadcast (p) */
                     "cold start" as which_game,
@@ -1051,5 +1057,3 @@ if quarantine_insert_ready:
     print(f"Shift data successfully loaded into nhl_data_staged.quarantine.shift_data table")
 else: 
     print(f"No new data to insert into nhl_data_staged.quarantine.shift_data, skipping insert")
-
-

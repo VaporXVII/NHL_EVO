@@ -88,7 +88,7 @@ sched_raw = spark.sql(f"""
                         and (
                             from_utc_timestamp(ingest_ts_utc, '{user_region}')::date = current_run_dte
                             or 
-                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_dte, 30) and current_run_dte
+                            from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_dte, 7) and current_run_dte
                             )
                       
     """)
@@ -263,15 +263,29 @@ if insert_ready:
 
     sched_silver.createOrReplaceTempView("schedules_insert_tmp")
     spark.sql(f"""
+              
+            with schedules as (
+
+                select 
+                    *, 
+                    max(season) over () as latest_season
+                from schedules_insert_tmp 
+
+            )
             
             merge into nhl_data_staged.games.schedules t 
-            using schedules_insert_tmp s 
+            using schedules s 
                 on t.season = s.season 
                 and t.game_id = s.game_id
                 and t.team_id = s.team_id 
                 and t.home_road = s.home_road 
                 ---not merging on game date in case of a rare circumstance where a game date gets changed, but do want to limit target table to games within the past week
                 and (
+                    (
+                        t.season = s.latest_season 
+
+                    )
+                    or 
                     (
                         t.game_date between 
                         date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 

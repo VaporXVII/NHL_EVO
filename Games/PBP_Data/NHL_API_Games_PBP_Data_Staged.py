@@ -1,13 +1,6 @@
-import sys
-from pathlib import Path
-
-if "__file__" in globals():
-    script_dir = Path(__file__).resolve().parent
-else:
-    script_dir = Path.cwd()
-
-project_root = script_dir.parents[1]
-sys.path.insert(0, str(project_root))
+import sys 
+username = spark.sql("select current_user()").first()[0]
+sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
@@ -66,7 +59,6 @@ if kickoff:
                     inner join nhl_data_staged.games.pbp_data b
                         on a.season = b.season
                         and a.game_id = b.game_id
-                    where 1 = 1
                         
 
                 )
@@ -95,17 +87,17 @@ if kickoff:
         ,
         current_season_dates as (
 
-                select /*+ broadcast (p) */ distinct
-                    a.season, 
-                    a.game_date,
-                    (p.pbp_table_season = 19001901)::boolean as cold_start_ind
-                from nhl_data_staged.games.schedules a
-                cross join season_param p
-                where 1 = 1
-                    and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                    and a.game_type in (2,3)
-                    and lower(a.home_road) = 'home'
-                qualify a.season = max(a.season) over()
+            select /*+ broadcast (p) */ distinct
+                a.season, 
+                a.game_date,
+                (p.pbp_table_season = 19001901)::boolean as cold_start_ind
+            from nhl_data_staged.games.schedules a
+            cross join season_param p
+            where 1 = 1
+                and a.game_date <= from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                and a.game_type in (2,3)
+                and lower(a.home_road) = 'home'
+            qualify a.season = max(a.season) over()
         )
         , 
         current_season_dates_idx as (
@@ -126,35 +118,36 @@ if kickoff:
     
     """)
     run_missing_ind = run_missing.select(f.col("run_missing_ind").alias("rmi")).first()["rmi"]
-    pbp_schema = spark.sql(f"""
-                           
-                    with schema_data as (
-
-                        select payload 
-                        from nhl_data_raw.games.pbp_data 
-                        where 1 = 1
-                            and payload is not null  
-                            and http_status = 200 
-                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
-                            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                        order by rand() 
-                    )
-                    ,
-                    schema_sample as (
-
-                        select payload 
-                        from schema_data
-                        tablesample (10 rows)
-
-                    )
-
-                    select schema_of_json_agg(payload) as json_schema 
-                    from schema_sample
-                
-                
-                           
-    """).first()["json_schema"]
     if run_missing_ind:
+
+        pbp_schema = spark.sql(f"""
+                           
+                with schema_data as (
+
+                    select payload 
+                    from nhl_data_raw.games.pbp_data 
+                    where 1 = 1
+                        and payload is not null  
+                        and http_status = 200 
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= add_months(from_utc_timestamp(current_timestamp(), '{user_region}')::date, -6)
+                        and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                    order by rand() 
+                )
+                ,
+                schema_sample as (
+
+                    select payload 
+                    from schema_data
+                    tablesample (10 rows)
+
+                )
+
+                select schema_of_json_agg(payload) as json_schema 
+                from schema_sample
+            
+                
+                           
+            """).first()["json_schema"]
         
         spark.sql(f"""
                   
