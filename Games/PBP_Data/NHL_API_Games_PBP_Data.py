@@ -61,10 +61,12 @@ spark.sql(f"""
         and a.active_row = true 
         ---below allows records that have been inserted or updated to be eligible for MERGE/INSERT/UPDATE
         and (
-        a.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
-        or 
-        a.insert_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
-        )
+                a.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
+                or 
+                a.insert_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
+                or 
+                a.update_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
+            )
 
 
     )
@@ -109,7 +111,6 @@ spark.sql(f"""
         on a.second_player_id = p2.player_id
     left join players p3 
         on a.third_player_id = p3.player_id
-    where 1 = 1
 
     )
 
@@ -119,10 +120,6 @@ spark.sql(f"""
     and t.game_id = s.game_id
     and t.game_date = s.game_date
     and t.event_idx = s.event_idx 
-    and t.game_date between 
-        date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
-        and 
-        from_utc_timestamp(current_timestamp(), '{user_region}')::date
 
     when matched and (
     

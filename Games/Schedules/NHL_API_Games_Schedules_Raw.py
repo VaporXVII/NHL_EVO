@@ -1,6 +1,14 @@
-import sys 
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+import sys
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
+
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f, types as t 
@@ -40,21 +48,38 @@ def to_date(x):
     return x.date() if isinstance(x, dt.datetime) else x
 
 schedules = spark.sql(f"""
+                      
+                    with recent_season as (
 
-                    select 
+                        select 
+                            coalesce(min(game_date), '1900-01-01'::date) as start_date
+                        from nhl_data_staged.games.schedules 
+                        where 1 = 1
+                            and game_date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
+
+                    )
+
+                    select /*+ broadcast (b) */ 
                         max(season)::integer as season,
                         max(pre_season_start_date)::date as ps_start_date,
                         max(regular_season_start_date)::date as rs_start_date,
                         max(regular_season_end_date)::date as rs_end_date,
                         max(game_date) filter (where game_type = 2)::date as rs_last_game_date,
                         max(playoff_end_date)::date as playoff_end_date,
+                        (date_diff(
+
+                            min(from_utc_timestamp(current_timestamp(), '{user_region}')::date), 
+                            min(game_date)
+                        ) = 7)::boolean as 7_day_trigger,
                         (max(regular_season_end_date) >= date_sub(max(game_date) filter (where game_type = 2), 1))::boolean as sched_fully_loaded
-                    from nhl_data_staged.games.schedules a 
+                    from nhl_data_staged.games.schedules a
+                    cross join recent_season b   
                     where 1 = 1
                         and a.game_type between 1 and 3      
-                        and a.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 365)
+                        and a.game_date >= b.start_date 
+                        
 
-    """)
+""")
 missing_dates = spark.sql(f"""
     
                     with dates as (
@@ -63,7 +88,6 @@ missing_dates = spark.sql(f"""
                             min(request_key)::date as start_date,
                             max(request_key)::date as end_date 
                         from nhl_data_raw.games.schedules
-                        where 1 = 1
 
                     )
                     , 
@@ -84,7 +108,7 @@ missing_dates = spark.sql(f"""
                     left anti join nhl_data_staged.games.schedules c 
                         on a.game_date = c.game_date
 
-    """)
+""")
 ready = True
 missing_ready = not missing_dates.isEmpty()
 
@@ -145,6 +169,14 @@ if ready:
         start_dt = rs_end_date 
         end_dt = playoff_end_date 
         scrape_plan = "sec_scrape_playoffs_after_rs_end"
+
+    
+    #pipeline has been ran before and the new regular season schedule info has been captured but pre-season schedule has not been release 
+    elif (rs_start_date is not None and today < rs_start_date and not pre_season_start_date):
+
+        start_dt = rs_start_date 
+        end_dt = rs_start_date
+        scrape_plan = f"sec_scrape_after_initial_schedule_release_pre_season"
     
     #NHL may release a handful of regular season games before releasing full regular season schedule AND prior to releasing pre-season schedule 
     elif (rs_start_date is not None and today < rs_start_date and pre_season_start_date.year < rs_start_date.year and not schedule_fully_loaded):
@@ -167,6 +199,13 @@ if ready:
         scrape_plan = f"sec_scrape_at_least_{gap_window}_days_after_playoffs_ended"
 
     #scraping schedules within 30 days of playoffs ending 
+
+    elif playoff_end_date is not None and today >= rs_start_date and today <= rs_end_date: 
+        
+        start_dt = None
+        end_dt = None
+        scrape_plan = f"Upcoming season already loaded, no new scarpe to initialize" 
+        
     elif playoff_end_date is not None and (today - playoff_end_date).days < gap_window:
 
         start_dt = None 
@@ -180,6 +219,8 @@ if ready:
 
 
     all_dates = get_dates(start_dt, end_dt)
+
+start_dt, end_dt, scrape_plan
 
 scrape_ready = False
 if missing_ready: 
@@ -199,15 +240,7 @@ if scrape_ready:
     with ThreadPoolExecutor(max_workers = 5) as executor:
         _rate_lock = threading.Lock()
         api_data = []
-        futures = [
-            executor.submit(
-                call_api,
-                url,
-                rate_limiter,
-                "schedule"
-            )
-            for url in game_urls
-        ]
+        futures = [executor.submit(call_api, url, rate_limiter, endpoint = "schedule", s3_push = True) for url in game_urls]
         completed = 0 
         for future in concurrent.futures.as_completed(futures): 
             result = future.result()

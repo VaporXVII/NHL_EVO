@@ -47,6 +47,8 @@ spark.sql(f"""
                 a.game_date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2) 
                 or 
                 a.insert_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
+                or 
+                a.update_dte::date >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
                 )
     )
 
@@ -59,10 +61,7 @@ spark.sql(f"""
         and t.team_id = s.team_id 
         and t.player_id = s.player_id 
         and t.shift_id = s.shift_id 
-        and t.game_date between 
-            date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 2)
-            and 
-            from_utc_timestamp(current_timestamp(), '{user_region}')::date 
+
 
     when matched and (
 
