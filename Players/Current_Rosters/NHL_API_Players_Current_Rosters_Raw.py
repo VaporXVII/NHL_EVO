@@ -205,7 +205,7 @@ if insert_ready:
     """)
     spark.catalog.dropTempView("pgr_df_tmp")
     print(f"Player ids data successfully loaded into nhl_data_raw.players.player_game_rosters table")
-    if dt.datetime.today().day % 5 == 0:
-        run_table_maint(spark, "nhl_data_raw.players.player_game_rosters")
+    run_table_maint(spark, "nhl_data_raw.players.player_game_rosters")
+    
 else:
     print("No new data to load into nhl_data_raw.players.player_game_rosters table")

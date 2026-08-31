@@ -14,7 +14,7 @@ spark.conf.set("spark.sql.session.timeZone", f"{user_region}")
 insert_ready = False
 season_check_df = spark.sql(f"""
                             
-                            
+                ---pull latest season from schedules table
                 select 
                     (
                     select max(season) 
@@ -22,9 +22,10 @@ season_check_df = spark.sql(f"""
                     where 1 = 1
                         and from_utc_timestamp(current_timestamp(), '{user_region}')::date >= from_utc_timestamp(insert_dte, '{user_region}')::date
                     )::integer as sched_current_season,
+                ---pull latest season from team_details table
                     (
                     select 
-                        coalesce(max(current_season), 19001901) 
+                        coalesce(max(last_active_season), 19001901) 
                     from nhl_data_staged.teams.details
                     )::integer as team_ids_season,
                     not (sched_current_season = team_ids_season)::boolean as new_season_started_ind
@@ -73,9 +74,10 @@ if insert_ready:
                 
                 when matched and (
 
-                        from_utc_timestamp(t.ingest_ts_utc, '{user_region}') <> from_utc_timestamp(current_timestamp(), '{user_region}')
+                        from_utc_timestamp(t.ingest_ts_utc, '{user_region}')::date <> from_utc_timestamp(current_timestamp(), '{user_region}')::date
                         and s.http_status = 200 
                         and t.payload <> s.payload 
+                        
                 )
             
                 then update set 
