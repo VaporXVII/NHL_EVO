@@ -6,7 +6,7 @@ This section outlines planned enhancements to NHL EVO.
 
 ##### Lakeflow Declarative Pipelines
 
-Implement **Databricks Lakeflow Declarative Pipelines (LDP)** with streaming **AUTO CDC** and **Amazon S3 external volume integration** for the Play-by-Play (PBP) and Shift data endpoints.
+Implement **Databricks Lakeflow Declarative Pipelines (DLDP)** with streaming **AUTO CDC** and **Amazon S3 external volume integration** for the Play-by-Play (PBP) and Shift data endpoints.
 
 The existing batch architecture has served NHL EVO well. However, because the PBP and Shift endpoints are continuously queried during live games, a streaming architecture using Lakeflow Declarative Pipelines, S3, and AUTO CDC may provide a more efficient and scalable approach for ingesting and processing frequently changing game data.
 
