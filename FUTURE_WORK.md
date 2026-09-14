@@ -12,10 +12,17 @@ The existing batch architecture has served NHL EVO well. However, because the PB
 
 This feature has completed the development phase and is awaiting live-game testing when the upcoming NHL season begins. Testing will determine whether the architecture can operate effectively within the compute and streaming limitations of Databricks Free Edition without compromising existing job orchestrations. 
 
+#####Update as of 9/10/2026:
+Current investigation shows that while integrating S3 ingestion layer with Auto CDC can provide significant benefits, it does pose challenges from a compute standpoint with Databricks Community Edition. Namely, if a SQL Warehouse is active while DLDP is running, Databricks throws error stating user has hit their daily compute limits even though they haven't.
+
+============================================================================================
 
 ##### Databricks Asset Bundles (DAB)
 
 Incorporating Databricks Asset bundles to appropriately manage jobs orchestration as well as upcoming DLDP architecture. 
+
+
+============================================================================================
 
 ##### Play-by-Play Shift Game Level Assets 
 
