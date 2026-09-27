@@ -1,6 +1,13 @@
-import sys 
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+import sys
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
 
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w, DataFrame
@@ -90,6 +97,8 @@ sched_raw = spark.sql(f"""
                             or 
                             from_utc_timestamp(ingest_ts_utc, '{user_region}')::date between date_sub(current_run_dte, 7) and current_run_dte
                             )
+
+
                       
     """)
 ready = not sched_raw.isEmpty()
@@ -262,44 +271,30 @@ if ready:
 if insert_ready: 
 
     sched_silver.createOrReplaceTempView("schedules_insert_tmp")
+    pruning = spark.sql("""
+                            
+                select   
+                    min(season) as season_bound,
+                    min(game_date) as game_date_bound
+                from schedules_insert_tmp
+
+    """).first()
+    season_bound = pruning["season_bound"]
+    game_date_bound = pruning["game_date_bound"]
     spark.sql(f"""
               
-            with schedules as (
-
-                select 
-                    *, 
-                    max(season) over () as latest_season
-                from schedules_insert_tmp 
-
-            )
             
             merge into nhl_data_staged.games.schedules t 
-            using schedules s 
+            using schedules_insert_tmp s 
                 on t.season = s.season 
                 and t.game_id = s.game_id
                 and t.team_id = s.team_id 
                 and t.home_road = s.home_road 
+                ---using season and game_date boundaries for pruning of target table
+                and t.season >= {season_bound}
+                and t.game_date >= cast('{game_date_bound}' as date)
                 ---not merging on game date in case of a rare circumstance where a game date gets changed, but do want to limit target table to games within the past week
-                and (
-                    (
-                        t.season = s.latest_season 
 
-                    )
-                    or 
-                    (
-                        t.game_date between 
-                        date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 
-                        and 
-                        from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                    )
-                    or 
-                    (
-                        from_utc_timestamp(t.insert_dte, '{user_region}')::date between 
-                        date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7)
-                        and 
-                        from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                    )
-                )
             when matched and (
 
                     t.game_date <> s.game_date 
