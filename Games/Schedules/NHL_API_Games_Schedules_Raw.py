@@ -88,6 +88,8 @@ missing_dates = spark.sql(f"""
                             min(request_key)::date as start_date,
                             max(request_key)::date as end_date 
                         from nhl_data_raw.games.schedules
+                        where 1 = 1
+                            and request_key >= from_utc_timestamp(current_timestamp(), '{user_region}')::date 
 
                     )
                     , 
@@ -103,8 +105,8 @@ missing_dates = spark.sql(f"""
                     select 
                         a.game_date 
                     from dates_list a 
-                    left anti join nhl_data_raw.games.schedules b
-                        on a.game_date = b.request_key
+                    -- left anti join nhl_data_raw.games.schedules b
+                    --     on a.game_date = b.request_key
                     left anti join nhl_data_staged.games.schedules c 
                         on a.game_date = c.game_date
 
@@ -206,21 +208,24 @@ if ready:
         end_dt = None
         scrape_plan = f"Upcoming season already loaded, no new scarpe to initialize" 
         
-    elif playoff_end_date is not None and (today - playoff_end_date).days < gap_window:
+    elif playoff_end_date is not None and abs(today - playoff_end_date).days < gap_window:
 
         start_dt = None 
         end_dt = None 
         scrape_plan = f"sec_scrape_within_{gap_window}_days_after_playoffs"
+
+    elif pre_season_start_date <= today <= rs_start_date: 
+        start_dt = pre_season_start_date
+        end_dt = rs_start_date
+        scrape_plan = f"sec_scrape_before_regular_season_start"
 
     else: 
         start_dt = None
         end_dt = None
         scrape_plan = "issue_found"
 
-
+    print(f"Scraping schedules: {scrape_plan} for games between {start_dt} and {end_dt}")
     all_dates = get_dates(start_dt, end_dt)
-
-start_dt, end_dt, scrape_plan
 
 scrape_ready = False
 if missing_ready: 
@@ -303,55 +308,21 @@ if insert_ready:
                         and s.request_key is not null
 
                 )
-
-                merge into nhl_data_raw.games.schedules t 
-                using src s 
-                    on t.request_key = s.request_key 
-                    and t.api_url = s.api_url 
-
-                when matched and (
-                    
-                    t.payload <> s.payload 
-                    and s.payload_json.numberOfGames > 0 
-                    and size(s.payload_json.gameWeek) > 0
-                )
-
-                then update set 
-
-                    payload = s.payload,
-                    http_status = s.http_status,
-                    ingest_ts_utc = current_timestamp(),
-                    scrape_plan = s.scrape_plan 
-
-                when not matched and (
-
-                    ---ensuring that data coming through the API actually contains games and not an empty API call
-                    s.payload_json.numberOfGames > 0 
-                    and size(s.payload_json.gameWeek) > 0
-
-                )
                 
-                then insert (
-
+                insert into nhl_data_raw.games.schedules 
+                select 
                     endpoint, 
                     http_status,
                     request_key,
-                    api_url,
+                    api_url, 
                     payload,
-                    ingest_ts_utc,
+                    current_timestamp() as ingest_ts_utc,
                     scrape_plan
-
-                )
-                values (
-
-                    s.endpoint,
-                    s.http_status,
-                    s.request_key,
-                    s.api_url,
-                    s.payload,
-                    current_timestamp(), 
-                    s.scrape_plan
-                )
+                from src 
+                where 1 = 1
+                    and payload_json.numberOfGames > 0 
+                    and size(payload_json.gameWeek) > 0
+                
                 ;
 
 
