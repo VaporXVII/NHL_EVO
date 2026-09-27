@@ -33,227 +33,153 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
     return spark.sql(f"""
                 
 
-                    with date_param as (
+            with date_param as (
 
-                        select 
-                            from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte,
-                            current_timestamp() as current_run_time
-             
-
-
-                    ) 
-                    , 
-                    cold_start_check as (
-
-                        ---check to see if any rows have been inserted into nhl_data_staged.games.shift_data table, if none exist then set cold_start_ind = true
-                        ---using where to filter table down to avoid excess scanning
-                        select  
-                            request_key as game_id
-                        from nhl_data_raw.games.shift_data a
-                        cross join date_param b
-                        where 1 = 1
-                            and payload is not null 
-                            and ingest_ts_utc::date >= date_sub(current_run_dte, 150)
-                        
-                    )
-                    ,
-                    games as (
-                        
-                        ---pull list of all games and various information, limiting to games that occured in 20102011 season or later
-                        ---since NHL didn't start collecting shift data until then 
-                        select /*+ broadcast (p), broadcast (c), broadcast (b) */ 
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc,
-                            ---check to see if the game has been loaded into the bronze layer (i.e. is a cold start needed)
-                            ---accounts for if cold start takes place on date where games are in play and whether or not the game is in play yet
-                            ---using 25 minute delay from start time because shift data takes a little while longer to populate compared to PBP data 
-                            (
-                                c.game_id is null and b.game_id is null 
-                                and (
-                                    a.game_date < p.current_run_dte 
-                                    or (
-                                        a.game_date = p.current_run_dte
-                                        and from_utc_timestamp(p.current_run_time, '{user_region}') >= timestampadd(minute, 25, from_utc_timestamp(a.start_time_utc, '{user_region}'))
-                                    )
-
-                                )
-
-                            )::boolean as cold_start_ind,
-                            ---check to see if current timestamp is at least 15 minutes after the game's scheduled start time
-                            (
-                                a.game_date = p.current_run_dte and from_utc_timestamp(p.current_run_time, '{user_region}') >= timestampadd(minute, 25, from_utc_timestamp(a.start_time_utc, '{user_region}'))
-                            )::boolean as game_in_play_ind,
-                            ---check to see if the game was played in the prior two days
-                            (a.game_date between date_sub(p.current_run_dte, 2) and date_sub(p.current_run_dte, 1))::boolean as game_prior_two_ind,
-                            ---check to see if the game is part of the games_missing_shift table and is eligible for retry on the current date
-                            (b.game_id is not null)::boolean as known_missing_ind,
-                            (b.game_id is not null and c.game_id is null and p.current_run_dte >= b.next_retry_dte)::boolean as missing_game_ind,
-                            b.next_retry_dte
-                        from nhl_data_staged.games.schedules a
-                        cross join date_param p
-                        left join cold_start_check c 
-                            on a.game_id = c.game_id
-                        left join nhl_data_staged.ops.games_missing_shift b 
-                            on a.season = b.season 
-                            and a.game_id = b.game_id 
-                        where 1 = 1
-                            and a.season >= 20102011
-                            and a.game_type in (2,3)
-                            and lower(a.home_road) = 'home'
-                            and a.game_date <= p.current_run_dte
-
-                    )
-                    , 
-                    pbp_game_status as (
-
-                        ---check to see what the status of the game is based on the play by play data (most reliable method)
-                        ---further research found that some games in the 20092010 season didn't include a 'game-end' event_type
-                        ---therefore setting those games as having ended manually
-                        select
-                            game_id,
-                            game_date,
-                            coalesce(
-                                    max(1) filter (where lower(event_type) = 'game-end'), 
-                                    0
-                                    ) as game_ended_ind
-                        from nhl_data_staged.games.pbp_data
-                        where 1 = 1
-                            and season >= 20102011
-                            and period >= 3
-                        group by 
-                            game_id,
-                            game_date
-
-                    )
-                    ,
-                    games_ended_today as (
-
-                        ---check to see which games from the games list that were scheduled for the current date have ended
-                        select /*+ broadcast(b), broadcast(p) */ 
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc
-                        from games a  
-                        inner join pbp_game_status b
-                            on a.game_id = b.game_id
-                            and a.game_date = b.game_date 
-                            and b.game_ended_ind = 1
-                        cross join date_param p
-                        where 1 = 1
-                            and a.game_date = p.current_run_dte
-                            and a.cold_start_ind = false 
-                            and a.missing_game_ind = false 
-                            and a.known_missing_ind = false 
-                            
-                    )
-                    ,
-                    games_in_play as (
-
-                        ---check to see which games from the games list that were scheduled for the current date are in play
-                        ---based on the game start time + 15 minute window (NHL games typically don't drop the puck until about 15 minutes after)
-                        select /*+ broadcast (b) */ 
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc 
-                        from games a 
-                        left anti join games_ended_today b 
-                            on a.season = b.season 
-                            and a.game_id = b.game_id 
-                            and a.game_date = b.game_date 
-                        where 1 = 1
-                            and a.cold_start_ind = false 
-                            and a.missing_game_ind = false
-                            and a.known_missing_ind = false 
-                            and a.game_in_play_ind = true 
-                            
-                    )
-                    ,
-                    games_prior_two as (
-
-                        select
-                            a.season,
-                            a.game_id,
-                            a.game_date,
-                            a.start_time_utc
-                        from games a 
-                        where 1 = 1
-                            and a.cold_start_ind = false 
-                            and a.missing_game_ind = false 
-                            and a.known_missing_ind = false 
-                            and a.game_prior_two_ind = true  
-                            
-                    )
-                    ,
-                    final_games as (
+                select 
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte,
+                    from_utc_timestamp(current_timestamp(), '{user_region}')::timestamp as current_run_time
+        
 
 
-                        select 
-                            "in play" as which_game,
-                            season,
-                            game_id,
-                            game_date,
-                            start_time_utc
-                        from games_in_play 
-                        union all 
-                        select 
-                            "ended today" as which_game,
-                            season,
-                            game_id,
-                            game_date,
-                            start_time_utc
-                        from games_ended_today 
-                        union all 
-                        select 
-                            "last two" as which_game,
-                            season,
-                            game_id,
-                            game_date,
-                            start_time_utc
-                        from games_prior_two 
-                        union all 
-                        select 
-                            "missing shift data" as which_game,
-                            season,
-                            game_id,
-                            game_date,
-                            start_time_utc
-                        from games 
-                        where 1 = 1 
-                            and cold_start_ind = false 
-                            and missing_game_ind = true 
-                            and known_missing_ind = true
-                        union all 
-                        select /*+ broadcast (p) */
-                            "cold start" as which_game,
-                            season,
-                            game_id,
-                            game_date,
-                            start_time_utc
-                        from games a  
-                        cross join date_param p
-                        where 1 = 1
-                            and cold_start_ind = true 
-                            and (
-                                a.game_date < p.current_run_dte
-                                or a.game_in_play_ind = true
-                            )
+            ) 
+            , 
+            cold_start as (
 
-                    )
-                    select 
-                        
-                        a.which_game,
-                        a.game_id,
-                        a.game_date,
-                        a.start_time_utc,
-                        date_format(from_utc_timestamp(start_time_utc, '{user_region}'), 'hh:mm a') as game_start_time_cst,
-                        concat('https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId=', game_id) as api_url
-                    from final_games a 
-                    order by a.game_date, a.game_id
-                    {limit_clause}
+                ---check to see if any rows have been inserted into nhl_data_staged.games.shift_data table, if none exist then set cold_start_ind = true
+                ---using where to filter table down to avoid excess scanning
+                select /*+ broadcast (p) */  
+                    (count(*) = 0) as cold_start_ind
+                from nhl_evo_raw.games.shift_raw_data a
+                cross join date_param p
+                where 1 = 1
+                    ---limiting to games played during or after 20102011 season since NHL didn't start collecting shift data until then %
+                    and substring(a.request_key, 1, 4)::integer >= 2010
+                    and a.payload is not null 
+                    and a.http_status = 200 
+                    and from_utc_timestamp(a.ingest_ts_utc, '{user_region}') <= p.current_run_dte
+                
+            )
+            ,
+            games as (
+                
+                select /*+ broadcast (p) */
+                    a.season,
+                    a.game_date, 
+                    a.game_id,
+                    a.start_time_utc
+                from nhl_data_staged.games.schedules a 
+                cross join date_param p
+                where 1 = 1
+                    ---limit to games during or after the 20102011 season since NHL didn't start collecting shift data until then
+                    and a.season >= 20102011
+                    ---limit to only regular season or playoff games since shift data isn't collected for preseason games
+                    and a.game_type in (2,3)
+                    ---only need game ids and game dates so will limit to one side for performance
+                    and lower(a.home_road) = 'home'
+                    ---get games up until the current date
+                    and a.game_date <= p.current_run_dte
+
+            )
+            , 
+            games_missing as (
+
+                select /*+ broadcast (b) */
+                    a.season,
+                    a.game_id, 
+                    b.next_retry_dte
+                from games a  
+                inner join nhl_evo_raw.ops.games_missing_shift b 
+                    on a.season = b.season 
+                    and a.game_id = b.gameId
+            )
+            ,
+            games_missing_retry as (
+
+                select /*+ broadcast (p) */
+                    a.*
+                from games_missing a 
+                cross join date_param p 
+                where 1 = 1
+                    and a.next_retry_dte = p.current_run_dte 
+
+            )
+            ,
+            already_loaded as (
+
+                select /*+ broadcast (p), broadcast (b) */
+                    a.request_key as game_id
+                from nhl_evo_raw.games.shift_raw_data a  
+                cross join date_param p 
+                left anti join games_missing b 
+                    on a.request_key = b.game_id 
+                where 1 = 1
+                    and from_utc_timestamp(a.ingest_ts_utc, '{user_region}') < p.current_run_time - interval 2 days
+
+            )
+            ,
+            games_ended_today as (
+
+                select /*+ broadcast (p) */ 
+                    a.season,
+                    a.game_id
+                from games a 
+                cross join date_param p 
+                left semi join nhl_evo_staged.games.pbp_data c 
+                    on a.season = c.season 
+                    and a.game_id = c.game_id
+                    and lower(c.event_type) = 'game-end'
+                where 1 = 1
+                    and a.game_date = p.current_run_dte
+            )
+            ,
+            game_status as (
+
+                select /*+ broadcast (b), broadcast (c), broadcast (d), broadcast (e), broadcast (cs), broadcast (p) */
+                    a.*,
+                    cs.cold_start_ind,
+                    ---cold start takes precedent over all others 
+                    case when cs.cold_start_ind = true then 'cold start'
+                        --check to see if game is eligible for missing retry (defined as last_attempt_dte + 15 days)
+                        when d.game_id is not null then 'missing retry'
+                        --check to see if game is missing in list entirely
+                        when c.game_id is not null then 'missing shift data'
+                        ---check to see if game was played before the 2 day lookback window (valid because if it's missing pbp data then it won't be in the missing_pbp_data table)
+                        when a.game_date < p.current_run_dte - interval 2 days then 'already loaded' 
+                        ---check to see if game was played within the last two days to capture most relevant record 
+                        when a.game_date <> p.current_run_dte and a.game_date >= p.current_run_dte - interval 2 days then 'last two'
+                        ---check to see if game has ended today, will pause scrape until next day 
+                        when e.game_id is not null then 'ended today' 
+                        ---check to see if game is in play today 
+                        when a.game_date = current_date() and p.current_run_time >= timestampadd(minute, 15, from_utc_timestamp(a.start_time_utc, '{user_region}')) then 'in play'
+                        ---check to see if game is in play today but not yet started
+                        when a.game_date = current_date() and from_utc_timestamp(p.current_run_time, '{user_region}') < from_utc_timestamp(a.start_time_utc, '{user_region}') then 'not started'
+                        else 'unknown'
+                        end as which_game 
+                from games a 
+                left join already_loaded b 
+                    on a.game_id = b.game_id
+                left join games_missing c 
+                    on a.season = c.season 
+                    and a.game_id = c.game_id
+                left join games_missing_retry d 
+                    on a.season = d.season 
+                    and a.game_id = d.game_id 
+                left join games_ended_today e  
+                    on a.game_id = e.game_id
+                cross join cold_start cs 
+                cross join date_param p
+
+            )
+            
+            select distinct
+                a.*,
+                date_format(a.start_time_utc, 'hh:mm a') as game_start_time_cst,
+                concat('https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId=', a.game_id) as api_url
+            from game_status a 
+            where 1 = 1
+                and lower(a.which_game) not in ('not started', 'already loaded', 'missing shift data', 'unknown')
+            order by a.game_date desc, game_start_time_cst, a.game_id
+            {limit_clause}
                   
     """)
 
