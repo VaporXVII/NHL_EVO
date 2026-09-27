@@ -92,6 +92,7 @@ def insert_data(source: DataFrame, target_table: str, sample_size: int) -> None:
     spark.catalog.dropTempView("source_tmp")
     print(f"Player ids data successfully loaded into {target_table} table")
 
+
 season_search = spark.sql(f"""
 
                 with date_param as (
@@ -188,7 +189,7 @@ season_search = spark.sql(f"""
                     a.game_date,
                     a.game_type, 
                     a.date_idx,
-                    (a.date_idx % 15 = 0)::boolean as run_scrape_ind,
+                    (a.date_idx % 7 = 0)::boolean as run_scrape_ind,
                     (a.current_season <> b.last_active_season_players_table)::boolean as new_season_ind 
                 from current_season_dates_idx a 
                 cross join last_active_season b 
@@ -222,6 +223,13 @@ elif end_season == player_ids_table_last_active_season and run_scrape_ind:
     print(f"Current season in play and run_scrape_ind = true")
     end_season = player_ids_table_last_active_season
     ready = True
+
+elif run_scrape_ind: 
+    print(f"run_scrape_ind = true")
+    start_season = player_ids_table_last_active_season
+    end_season = player_ids_table_last_active_season
+    ready = True
+
 #if user has done scrape already and the both the most recent end season from schedules 
 #and most last active year from players master ids table are a match
 else: 
