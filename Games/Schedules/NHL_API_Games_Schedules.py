@@ -1,6 +1,13 @@
-import sys 
-username = spark.sql("select current_user()").first()[0]
-sys.path.append(f"/Workspace/Users/{username}/NHL_Pipeline")
+import sys
+from pathlib import Path
+
+if "__file__" in globals():
+    script_dir = Path(__file__).resolve().parent
+else:
+    script_dir = Path.cwd()
+
+project_root = script_dir.parents[1]
+sys.path.insert(0, str(project_root))
 
 from pyspark.sql import SparkSession 
 from pyspark.sql import functions as f, types as t, Window as w
@@ -112,6 +119,16 @@ if ready:
 if insert_ready: 
 
     sched_df.createOrReplaceTempView("schedules_insert_tmp")
+    pruning = spark.sql("""
+                            
+                select   
+                    min(season) as season_bound,
+                    min(game_date) as game_date_bound
+                from schedules_insert_tmp
+
+    """).first()
+    season_bound = pruning["season_bound"]
+    game_date_bound = pruning["game_date_bound"]
     spark.sql(f"""
 
         merge into nhl_data.games.schedules t 
@@ -121,22 +138,8 @@ if insert_ready:
             and t.team_id = s.team_id
             and s.team_id > 0 
             and s.team_id is not null 
-            and (
-                (
-                    t.game_date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7) 
-                    and 
-                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                )
-                or 
-                (
-                    from_utc_timestamp(t.insert_dte, '{user_region}')::date between 
-                    date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, 7)
-                    and 
-                    from_utc_timestamp(current_timestamp(), '{user_region}')::date
-                )
-
-        )
+            and t.season >= {season_bound} 
+            and t.game_date >= cast('{game_date_bound}' as date)
 
         when matched and (
 
