@@ -238,38 +238,61 @@ if ready:
 insert_ready = False
 if keep_going: 
     py_source = dbutils.entry_point.getDbutils().notebook().getContext().notebookPath().get().split("/")[-1]
-    shoots_lookup = (
+    if not skaters_raw.isEmpty():
+        shoots_lookup = (
 
 
-                explode_data(skaters_raw)
-                .transform(lambda c: c.toDF(*[convert_case(c) for c in c.columns]))
-                .select("player_id", "shoots_catches")
-                .unionByName(
-
-                    explode_data(goalies_raw)
+                    explode_data(skaters_raw)
                     .transform(lambda c: c.toDF(*[convert_case(c) for c in c.columns]))
                     .select("player_id", "shoots_catches")
-                        
-                )   
-                .withColumnRenamed("shoots_catches", "shoots_catches_lu")
-                .dropDuplicates(['player_id'])
+                    .unionByName(
 
-    )
+                        explode_data(goalies_raw)
+                        .transform(lambda c: c.toDF(*[convert_case(c) for c in c.columns]))
+                        .select("player_id", "shoots_catches")
+                            
+                    )   
+                    .withColumnRenamed("shoots_catches", "shoots_catches_lu")
+                    .dropDuplicates(['player_id'])
+
+        )
+    else: 
+        shoots_lookup = spark.sql(f"""
+                                  
+                    select 
+                        player_id,
+                        shoots_catches as shoots_catches_lu
+                    from nhl_data_staged.players.master_ids 
+                                  
+                                  
+        """)
     player_id_window = w.Window.partitionBy("player_id").orderBy(f.col("is_active").desc(), f.col("required_field_empty_rate").asc())
 
     players_silver = (
-
-                players_silver 
-                .join(f.broadcast(shoots_lookup), how = "left", on = "player_id")
-                .withColumn("shoots_catches", f.coalesce("shoots_catches_lu", "shoots_catches"))
+                players_silver
+                .join(
+                    f.broadcast(shoots_lookup),
+                    on = "player_id",
+                    how = "left"
+                )
+                .withColumn(
+                    "shoots_catches",
+                    f.coalesce(
+                        f.col("shoots_catches_lu"),
+                        f.col("shoots_catches")
+                    )
+                )
+                .drop("shoots_catches_lu")
                 .select(*keep_fields, "required_field_empty_rate")
                 .filter(f.col("player_id").isNotNull())
                 .drop("player_pos_cat")
-                .withColumn("row_num", f.row_number().over(player_id_window))
+                .withColumn(
+                    "row_num",
+                    f.row_number().over(player_id_window)
+                )
                 .withColumn("py_source", f.lit(py_source))
                 .filter(f.col("row_num") == 1)
-
-    )
+        )
 
     players_silver_schema = t.StructType([
 
