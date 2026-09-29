@@ -392,22 +392,22 @@ if kickoff:
         max_429_rate = 0.02
     )
 
-    pbp_schema = spark.sql(f"""
+    # pbp_schema = spark.sql(f"""
                              
-        select 
-            schema_of_json_agg(payload) as json_schema
-        from nhl_data_raw.games.pbp_data
-        where 1 = 1
-            and http_status = 200
-            and payload is not null
-            ---only consider schemas that are within the last year vs all time
-            and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= date_sub(current_date(), 365)
+    #     select 
+    #         schema_of_json_agg(payload) as json_schema
+    #     from nhl_data_raw.games.pbp_data
+    #     where 1 = 1
+    #         and http_status = 200
+    #         and payload is not null
+    #         ---only consider schemas that are within the last year vs all time
+    #         and from_utc_timestamp(ingest_ts_utc, '{user_region}')::date >= date_sub(current_date(), 365)
             
-    """).first()["json_schema"]
+    # """).first()["json_schema"]
 
     while n < max_loops:
 
-        games = find_games(limit_n = batch_size, raw_schema = pbp_schema)
+        games = find_games(limit_n = batch_size)
 
         # Collect the small batch once instead of running count(), isEmpty(), and multiple collect() operations.
         game_rows = (
