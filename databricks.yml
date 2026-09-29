@@ -2,9 +2,19 @@
 bundle:
   name: "NHL_EVO_Live_Game_Data"
 
+
 include:
   - resources/*.yml
   - resources/*/*.yml
+  - Teams/Lines/*.yml
+  - Games/Vegas_Totals/*.yml
+
+sync: 
+  include: 
+    - NHL_EVO_PBP/**
+    - NHL_EVO_Team_Lines/**
+    - Teams/Lines/**
+    - Games/Vegas_Totals/**
 
 
 targets:
@@ -20,6 +30,8 @@ targets:
   # The 'prod' target, used for production deployment.
   prod:
     mode: production
+    presets:
+      trigger_pause_status: UNPAUSED
     workspace:
       host: https://dbc-93e72fa0-2c4b.cloud.databricks.com
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

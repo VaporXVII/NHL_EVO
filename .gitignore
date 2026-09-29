@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private Team Lines Resources
+/NHL_EVO_Team_Lines/
+/NHL_EVO_Live_DLDP_Files/
+/Teams/Lines/
+/Ops/Alerts/
+/Games/Vegas_Totals/
+/NHL_EVO_Vegas_Totals/
