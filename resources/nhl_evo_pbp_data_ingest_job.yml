@@ -1,0 +1,33 @@
+resources:
+  jobs:
+    NHL_EVO_PBP_Data_Ingest:
+      name: NHL_EVO_PBP_Data_Ingest
+      email_notifications:
+        on_success:
+          - ${workspace.current_user.userName}
+        on_failure:
+          - ${workspace.current_user.userName}
+      schedule:
+        quartz_cron_expression: 0 1,30 17-23 * * ?
+        timezone_id: America/Chicago
+        pause_status: PAUSED
+
+      tasks:
+        - task_key: PBP_Data_Raw
+          spark_python_task:
+            python_file: ../Games/PBP_Data/NHL_API_Games_PBP_Data_Raw.py
+          max_retries: 1
+          min_retry_interval_millis: 30000
+          retry_on_timeout: true
+          disable_auto_optimization: false
+          notification_settings:
+            no_alert_for_skipped_runs: true
+            no_alert_for_canceled_runs: true
+          environment_key: Default
+      queue:
+        enabled: true
+      environments:
+        - environment_key: Default
+          spec:
+            environment_version: "5"
+      performance_target: PERFORMANCE_OPTIMIZED
