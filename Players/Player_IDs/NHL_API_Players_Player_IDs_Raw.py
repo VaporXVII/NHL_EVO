@@ -25,19 +25,20 @@ def insert_data(source: DataFrame, target_table: str, sample_size: int) -> None:
     source.createOrReplaceTempView("source_tmp")
     json_schema = spark.sql(f"""
                             
-                            with random_sample as (
-                                
-                                select 
-                                    payload 
-                                from source_tmp 
-                                tablesample({sample_size} rows)
+                with random_sample as (
+                    
+                    select 
+                        payload 
+                    from source_tmp 
+                    tablesample({sample_size} rows)
 
-                            )
-                            select    
-                                schema_of_json_agg(payload) as json_schema 
-                            from random_sample
+                )
+                select    
+                    schema_of_json_agg(payload) as json_schema 
+                from random_sample
 
-                        """).first()["json_schema"]
+            """).first()["json_schema"]
+    
     spark.sql(f"""
                 with src as (
 
@@ -105,12 +106,13 @@ season_search = spark.sql(f"""
                     ---pipeline runs schedules tables before any other tables, therefore coalesce(season, 19001901) is not needed
                     select /*+ broacast (p) */
                         min(a.season)::integer as start_season,
-                        max(a.season)::integer as end_season
+                        max(a.season)::integer as end_season,
+                        max(p.current_run_dte = a.regular_season_start_date) as start_of_rs_ind
                     from nhl_data_staged.games.schedules a 
                     cross join date_param p 
                     where 1 = 1
                         and a.game_type between 1 and 3
-                        and a.game_date <= p.current_run_dte 
+                        and a.game_date <= p.current_run_dte
 
                 )
                 , 
@@ -161,6 +163,7 @@ season_search = spark.sql(f"""
                     select /*+ broadcast(b) */
                         b.start_season,
                         b.end_season,
+                        b.start_of_rs_ind,
                         a.season as current_season,
                         a.game_date,
                         a.game_type, 
@@ -190,19 +193,22 @@ season_search = spark.sql(f"""
                     a.game_type, 
                     a.date_idx,
                     (a.date_idx % 7 = 0)::boolean as run_scrape_ind,
-                    (a.current_season <> b.last_active_season_players_table)::boolean as new_season_ind 
+                    (a.current_season <> b.last_active_season_players_table)::boolean as new_season_ind,
+                    a.start_of_rs_ind::boolean as start_of_rs_ind
                 from current_season_dates_idx a 
                 cross join last_active_season b 
                 order by a.game_date desc 
                 limit 1
                           
-""")
+""").collect()[0]
 
-start_season = season_search.select(f.col("start_season").alias("start")).first()["start"]
-end_season = season_search.select(f.col("last_active_season_sched_table").alias("end")).first()["end"]
-player_ids_table_last_active_season = season_search.select(f.col("last_active_season_players_table").alias("las")).first()["las"]
-run_scrape_ind = season_search.select(f.col("run_scrape_ind").alias("rsi")).first()["rsi"]
-new_season_ind = season_search.select(f.col("new_season_ind").alias("new")).first()["new"]
+start_season = season_search["start_season"]
+end_season = season_search["last_active_season_sched_table"]
+player_ids_table_last_active_season = season_search["last_active_season_players_table"]
+run_scrape_ind = season_search["run_scrape_ind"]
+new_season_ind = season_search["new_season_ind"]
+start_of_rs_ind = season_search["start_of_rs_ind"]
+
 
 #if player ids have not been scraped yet at all, even though variables are set above, setting them again to make intent clear
 ready = False
@@ -210,6 +216,21 @@ if player_ids_table_last_active_season == 19001901:
     print(f"Cold start")
     start_season = start_season 
     ready = True
+
+#if it's the start of the regular season, perform scrape to ensure data is as up to date as possible
+elif start_of_rs_ind: 
+    print(f"Start of regular season")
+    start_season = player_ids_table_last_active_season
+    end_season = player_ids_table_last_active_season
+    ready = True 
+
+#if the scrape happens on a date where the # of days played thus far % 7 = 0, run scrape  
+elif run_scrape_ind: 
+    print(f"run_scrape_ind = true")
+    start_season = player_ids_table_last_active_season
+    end_season = player_ids_table_last_active_season
+    ready = True
+
 #if user has done scrape of player ids already and the most recent end season from schedules
 #doesn't match most recent end season from players table 
 elif new_season_ind: 
@@ -217,6 +238,7 @@ elif new_season_ind:
     #setting start season to be the prior season and the end season to be the current season/ upcoming season
     start_season = player_ids_table_last_active_season
     ready = True
+
 #if user has done scrape of player ids already and want to do an incremental refresh to capture any new players that have come in 
 #only executing this block if the regular season is currently in play 
 elif end_season == player_ids_table_last_active_season and run_scrape_ind: 
@@ -224,11 +246,6 @@ elif end_season == player_ids_table_last_active_season and run_scrape_ind:
     end_season = player_ids_table_last_active_season
     ready = True
 
-elif run_scrape_ind: 
-    print(f"run_scrape_ind = true")
-    start_season = player_ids_table_last_active_season
-    end_season = player_ids_table_last_active_season
-    ready = True
 
 #if user has done scrape already and the both the most recent end season from schedules 
 #and most last active year from players master ids table are a match
@@ -269,7 +286,7 @@ if ready:
                 api_data.append(result)
                 completed += 1 
                 if completed % 5 == 0:
-                    print(f"{completed} / {len(player_urls)} schedule urls fetched.")
+                    print(f"{completed} / {len(player_urls)} player urls fetched.")
 
         print(f"Player ids by player search scraped.")
         row_sample = max(1, math.ceil(len(api_data) * 0.25))
