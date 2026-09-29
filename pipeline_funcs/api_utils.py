@@ -2,6 +2,9 @@ from collections import deque
 import concurrent.futures 
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 import gc, json, random, threading, time, psutil, requests, certifi 
+from datetime import datetime, UTC 
+from urllib.parse import urlparse, parse_qs
+from pipeline_funcs.s3_bucket import s3_return, s3_create_dir, s3_ingest
 
 _rate_lock = threading.Lock()
 next_allowed = 0.0 
@@ -109,16 +112,82 @@ def memory_check(api_data: list, memory_limit_pct: float) -> bool:
     return len(api_data) > 0 and driver_mem_pct() >= memory_limit_pct 
 
 
-def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | int | None = None, max_attempts: int = 3, time_out: int = 20):
+def chunk_list(items, chunk_size):
     
-    #req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
+    for i in range(0, len(items), chunk_size):
+        yield items[i:i + chunk_size]
+
+
+def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None, optional_headers: dict | None = None, push_to_s3: bool = False):
+
+    rate_limiter = RateLim(rps = starting_rps)
+    results = [] 
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers = max_workers) as executor:
+
+        future_to_url = {executor.submit(call_api, url, rate_limiter, endpoint = endpoint, request_key = None, custom_headers = optional_headers, s3_push = push_to_s3): url for url in urls}
+
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+
+            try:
+                row = future.result()
+            except Exception as e:
+
+                if request_key is not None:
+                    req_key = request_key
+
+                elif endpoint.lower() == "pbp":
+                    req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
+
+                elif endpoint.lower() == "shift":
+                    req_key = int(url.split("gameId=")[-1])
+
+                elif endpoint.lower() == "player_search":
+                    req_key = url.split('/')[-1]
+
+                elif endpoint.lower() == "schedule":
+                    req_key = url.split('/')[-1]
+
+                elif endpoint.lower() == "team_details":
+                    req_key = None
+                
+                elif endpoint.lower() == "vegas_totals":
+                    query_params = parse_qs(urlparse(url).query)
+                    req_key = query_params.get("date", [None])[0]
+
+                else:
+                    req_key = url
+                    
+                row = {
+                    
+                    "endpoint": f"{endpoint}",
+                    "request_key": req_key,
+                    "http_status": None,
+                    "payload": None,
+                    "api_url": url,
+                    "scrape_ts_utc": None
+    
+                }
+
+            results.append(row)
+            completed_count += 1
+            if completed_count % 500 == 0:
+                print(f"completed {completed_count:,} of {len(urls):,} scrapes in current batch")
+
+
+    return results 
+
+
+def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | int | None = None, max_attempts: int = 3, time_out: int = 20, custom_headers: dict | None = None, s3_push: bool = False):
+    
     if request_key is not None:
         req_key = request_key
 
-    elif endpoint.lower() == "pbp_data":
+    elif endpoint.lower() == "pbp":
         req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
 
-    elif endpoint.lower() == "shift_data":
+    elif endpoint.lower() == "shift":
         req_key = int(url.split("gameId=")[-1])
 
     elif endpoint.lower() == "player_search":
@@ -126,6 +195,13 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
     
     elif endpoint.lower() == "schedule":
         req_key = url.split('/')[-1]
+    
+    elif endpoint.lower() == "team_details":
+        req_key = None
+
+    elif endpoint.lower() == "vegas_totals":
+        query_params = parse_qs(urlparse(url).query)
+        req_key = query_params.get("date", [None])[0]
 
     else:
         req_key = url
@@ -134,9 +210,8 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
 
         throttle(rate_limiter = rate_limiter)
         try:
-            #throttle(rate_limiter = rate_limiter)    
-
-            response = requests.get(url, timeout = time_out)
+            scrape_ts_utc = datetime.now(UTC).replace(tzinfo = None)
+            response = requests.get(url, timeout = time_out, headers = custom_headers)
             last_status = response.status_code
             new_rps, action = rate_limiter.record_status(last_status)
 
@@ -149,26 +224,42 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                 if isinstance(payload, list):
                     payload = {"data": payload}
 
-                return {
+                api_response = {
+
                     "endpoint": f"{endpoint}",
                     "request_key": req_key,
                     "http_status": int(last_status),
                     "payload": json.dumps(payload, ensure_ascii = False),
-                    "api_url": url
-                }
+                    "api_url": url, 
+                    "scrape_ts_utc": scrape_ts_utc,
+
+                } 
+
+                if s3_push:
+                    print(s3_ingest(api_response, s3_ext_vol = endpoint, backfill = False))
+                    
+                return api_response
+                    
 
             if last_status in (429, 502, 503, 504):
                 time.sleep((2 ** attempt) + random.random())
                 continue
 
-            return {
+            api_response = {
+                
                 "endpoint": f"{endpoint}",
                 "request_key": req_key,
                 "http_status": int(last_status),
                 "payload": None,
-                "api_url": url
-            }
+                "api_url": url,
+                "scrape_ts_utc": scrape_ts_utc
+            } 
 
+            if s3_push:
+                print(s3_ingest(api_response, s3_ext_vol = endpoint, backfill = False))
+
+            return api_response 
+        
         except (requests.RequestException, ValueError):
             
             new_rps, action = rate_limiter.record_status(None)
@@ -180,65 +271,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         "request_key": req_key,
         "http_status": None,
         "payload": None,
-        "api_url": url
-    }
+        "api_url": url, 
+        "scrape_ts_utc": None
 
-
-def chunk_list(items, chunk_size):
-    
-    for i in range(0, len(items), chunk_size):
-        yield items[i:i + chunk_size]
-
-
-def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None):
-
-    rate_limiter = RateLim(rps = starting_rps)
-    results = [] 
-    completed_count = 0
-    with ThreadPoolExecutor(max_workers = max_workers) as executor:
-
-        future_to_url = {
-            executor.submit(call_api, url, rate_limiter, endpoint = endpoint, request_key = None): url
-            for url in urls
-        }
-
-        for future in as_completed(future_to_url):
-            url = future_to_url[future]
-
-            try:
-                row = future.result()
-            except Exception as e:
-                #game_id = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1]) if "pbp" in endpoint.lower() else int(url.split("gameId=")[-1])
-                if request_key is not None:
-                    req_key = request_key
-
-                elif endpoint.lower() == "pbp_data":
-                    req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
-
-                elif endpoint.lower() == "shift_data":
-                    req_key = int(url.split("gameId=")[-1])
-
-                elif endpoint.lower() == "player_search":
-                    req_key = url.split('/')[-1]
-
-                elif endpoint.lower() == "schedule":
-                    req_key = url.split('/')[-1]
-
-                else:
-                    req_key = url
-                row = {
-                    "endpoint": f"{endpoint}",
-                    "request_key": req_key,
-                    "http_status": None,
-                    "payload": None,
-                    "api_url": url
-                }
-
-            results.append(row)
-            #rate_limiter.record_status(row["http_status"])
-            completed_count += 1
-            if completed_count % 500 == 0:
-                print(f"completed {completed_count:,} of {len(urls):,} scrapes in current batch")
-
-
-    return results 
+    } 
