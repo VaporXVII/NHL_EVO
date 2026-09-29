@@ -4,6 +4,9 @@ from pyspark.errors import AnalysisException
 def get_games(spark: SparkSession, table_name: str) -> DataFrame: 
 
     try: 
+        #limiting to regular and postseason games only for team lines since source site doesn't track line combos for preseason games 
+        #limiting to regular and postseason games only for shift data since NHL doesn't track shift data for preseason games
+        game_type_clause = f"and a.game_type in (2,3)" if "team_lines" in table_name.lower() or "shift_data" in table_name.lower() or "vegas_totals" in table_name.lower() else f"and a.game_type in (1,2,3)"
         return spark.sql(f"""
                         
                         with cold_start as (
@@ -20,11 +23,11 @@ def get_games(spark: SparkSession, table_name: str) -> DataFrame:
                                 game_date                
                             from nhl_data_staged.games.schedules a 
                             where 1 = 1
-                                and game_type in (2,3)
+                                {game_type_clause}
                                 and a.game_date between 
-                                    date_sub(from_utc_timestamp(current_date(), 'America/Chicago')::date, 2) 
+                                    date_sub(from_utc_timestamp(current_timestamp(), 'America/Chicago')::date, 2) 
                                         and 
-                                    from_utc_timestamp(current_date(), 'America/Chicago')::date
+                                    from_utc_timestamp(current_timestamp(), 'America/Chicago')::date
                         )
 
                         select 
