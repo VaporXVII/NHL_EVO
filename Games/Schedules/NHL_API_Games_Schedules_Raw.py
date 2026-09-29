@@ -49,31 +49,39 @@ def to_date(x):
 
 schedules = spark.sql(f"""
                       
-                    with recent_season as (
+                    with date_param as (
+
 
                         select 
-                            coalesce(min(game_date), '1900-01-01'::date) as start_date
-                        from nhl_data_staged.games.schedules 
+                            from_utc_timestamp(current_timestamp(), '{user_region}')::date as current_run_dte
+
+                    ) 
+                    ,
+                    recent_season as (
+
+                        select /*+ broadcast (p) */ 
+                            coalesce(min(a.game_date), '1900-01-01'::date) as start_date,
+                            coalesce(max(a.regular_season_start_date - interval 1 day = p.current_run_dte), False)::boolean as start_of_rs_ind
+                        from nhl_data_staged.games.schedules a  
+                        cross join date_param p 
                         where 1 = 1
-                            and game_date >= from_utc_timestamp(current_timestamp(), '{user_region}')::date
+                            and game_date >= p.current_run_dte
 
                     )
 
-                    select /*+ broadcast (b) */ 
-                        max(season)::integer as season,
-                        max(pre_season_start_date)::date as ps_start_date,
-                        max(regular_season_start_date)::date as rs_start_date,
-                        max(regular_season_end_date)::date as rs_end_date,
-                        max(game_date) filter (where game_type = 2)::date as rs_last_game_date,
-                        max(playoff_end_date)::date as playoff_end_date,
-                        (date_diff(
-
-                            min(from_utc_timestamp(current_timestamp(), '{user_region}')::date), 
-                            min(game_date)
-                        ) = 7)::boolean as 7_day_trigger,
-                        (max(regular_season_end_date) >= date_sub(max(game_date) filter (where game_type = 2), 1))::boolean as sched_fully_loaded
+                    select /*+ broadcast (b), broadcast (p) */ 
+                        max(a.season)::integer as season,
+                        max(a.pre_season_start_date)::date as preseason_start_date,
+                        max(a.regular_season_start_date)::date as regseason_start_date,
+                        max(a.regular_season_end_date)::date as regseason_end_date,
+                        max(a.game_date) filter (where a.game_type = 2)::date as regseason_last_game_date,
+                        max(a.playoff_end_date)::date as playoff_end_date,
+                        (date_diff(min(p.current_run_dte), min(a.game_date)) = 7)::boolean as run_scrape_ind,
+                        (max(a.regular_season_end_date) >= date_sub(max(a.game_date) filter (where a.game_type = 2), 1))::boolean as sched_fully_loaded,
+                        max(b.start_of_rs_ind)::boolean as start_of_rs_ind
                     from nhl_data_staged.games.schedules a
                     cross join recent_season b   
+                    cross join date_param p 
                     where 1 = 1
                         and a.game_type between 1 and 3      
                         and a.game_date >= b.start_date 
@@ -105,8 +113,6 @@ missing_dates = spark.sql(f"""
                     select 
                         a.game_date 
                     from dates_list a 
-                    -- left anti join nhl_data_raw.games.schedules b
-                    --     on a.game_date = b.request_key
                     left anti join nhl_data_staged.games.schedules c 
                         on a.game_date = c.game_date
 
@@ -115,23 +121,26 @@ ready = True
 missing_ready = not missing_dates.isEmpty()
 
 if ready: 
+    
     #today helps get the date in 'America/Chicago' (or whichever region name the user specified in get_utc_region module) formatting so that the date is set properly
     today = today_central()
     schedule_info = (
 
             schedules
-            .select("ps_start_date", "rs_start_date", "rs_end_date", "rs_last_game_date", "playoff_end_date", "sched_fully_loaded")
-            .first()
+            .select("preseason_start_date", "regseason_start_date", "regseason_end_date", "regseason_last_game_date", "playoff_end_date", "sched_fully_loaded", "start_of_rs_ind")
+            .collect()[0]
     )
-    pre_season_start_date = to_date(schedule_info["ps_start_date"])
-    rs_start_date = to_date(schedule_info["rs_start_date"])
-    rs_end_date = to_date(schedule_info["rs_end_date"])
-    rs_last_game_date = to_date(schedule_info["rs_last_game_date"])
+    pre_season_start_date = to_date(schedule_info["preseason_start_date"])
+    regseason_start_date = to_date(schedule_info["regseason_start_date"])
+    regseason_end_date = to_date(schedule_info["regseason_end_date"])
+    regseason_last_game_date = to_date(schedule_info["regseason_last_game_date"])
     playoff_end_date = to_date(schedule_info["playoff_end_date"])
     schedule_fully_loaded = schedule_info["sched_fully_loaded"]
+    start_of_rs_ind = schedule_info["start_of_rs_ind"]
+
     gap_window = 30
     #pipeline has never been ran and user runs script for the first time
-    if rs_end_date is None:
+    if regseason_end_date is None:
         start_dt = dt.date(2008, 10, 1)
 
         #user runs script before the current season has ended 
@@ -144,46 +153,53 @@ if ready:
             end_dt = dt.date(today.year + 1, 6, 30)
             scrape_plan = "init_scrape_outside_season"
 
+    #pipeline has been run before and is being ran on the day before the start of the regular season
+    elif start_of_rs_ind: 
+        
+        start_dt = regseason_start_date 
+        end_dt = regseason_end_date 
+        scrape_plan = "sec_scrape_on_first_day_of_regular_season"
+    
     #pipeline has been run before and is being ran again on the same day as the last game of the regular season 
     #(just in case playoff schedules have been established and loaded)
-    elif (rs_start_date is not None and rs_start_date <= today <= rs_last_game_date):
+    elif (regseason_start_date is not None and regseason_start_date <= today <= regseason_last_game_date):
 
-        start_dt = rs_end_date
+        start_dt = regseason_end_date
         end_dt = playoff_end_date
         scrape_plan = "sec_scrape_rs_last_game"
     
     #pipeline has been run before but is being ran before end of regular season 
-    elif (rs_start_date is not None and rs_start_date <= today < rs_end_date):
+    elif (regseason_start_date is not None and regseason_start_date <= today < regseason_end_date):
         
         start_dt = None
         end_dt = None 
     
     #outlier scenario in case NHL doesn't have playoff start date set when the regular season schedule is released 
-    elif (rs_start_date is not None and rs_end_date is not None and playoff_end_date is None and 1 <= today.month <= 3 and today.day in (1, 15, 28)):
+    elif (regseason_start_date is not None and regseason_end_date is not None and playoff_end_date is None and 1 <= today.month <= 3 and today.day in (1, 15, 28)):
 
-        start_dt = rs_start_date
-        end_dt = rs_end_date
+        start_dt = regseason_start_date
+        end_dt = regseason_end_date
         scrape_plan = "sec_scrape_playoff_check_within_rs"
 
     #pipeline has been ran before and today is on or after the end of the regular season
-    elif (rs_end_date is not None and playoff_end_date is not None and rs_end_date <= today <= playoff_end_date):
+    elif (regseason_end_date is not None and playoff_end_date is not None and regseason_end_date <= today <= playoff_end_date):
 
-        start_dt = rs_end_date 
+        start_dt = regseason_end_date 
         end_dt = playoff_end_date 
         scrape_plan = "sec_scrape_playoffs_after_rs_end"
 
     
     #pipeline has been ran before and the new regular season schedule info has been captured but pre-season schedule has not been release 
-    elif (rs_start_date is not None and today < rs_start_date and not pre_season_start_date):
+    elif (regseason_start_date is not None and today < regseason_start_date and not pre_season_start_date):
 
-        start_dt = rs_start_date 
-        end_dt = rs_start_date
+        start_dt = regseason_start_date 
+        end_dt = regseason_start_date
         scrape_plan = f"sec_scrape_after_initial_schedule_release_pre_season"
     
     #NHL may release a handful of regular season games before releasing full regular season schedule AND prior to releasing pre-season schedule 
-    elif (rs_start_date is not None and today < rs_start_date and pre_season_start_date.year < rs_start_date.year and not schedule_fully_loaded):
+    elif (regseason_start_date is not None and today < regseason_start_date and pre_season_start_date.year < regseason_start_date.year and not schedule_fully_loaded):
 
-        start_dt = rs_start_date 
+        start_dt = regseason_start_date 
         end_dt = playoff_end_date
         scrape_plan = f"sec_scrape_after_initial_schedule_release"
 
@@ -202,7 +218,7 @@ if ready:
 
     #scraping schedules within 30 days of playoffs ending 
 
-    elif playoff_end_date is not None and today >= rs_start_date and today <= rs_end_date: 
+    elif playoff_end_date is not None and today >= regseason_start_date and today <= regseason_end_date: 
         
         start_dt = None
         end_dt = None
@@ -214,9 +230,9 @@ if ready:
         end_dt = None 
         scrape_plan = f"sec_scrape_within_{gap_window}_days_after_playoffs"
 
-    elif pre_season_start_date <= today <= rs_start_date: 
+    elif pre_season_start_date <= today <= regseason_start_date: 
         start_dt = pre_season_start_date
-        end_dt = rs_start_date
+        end_dt = regseason_start_date
         scrape_plan = f"sec_scrape_before_regular_season_start"
 
     else: 
@@ -224,7 +240,7 @@ if ready:
         end_dt = None
         scrape_plan = "issue_found"
 
-    print(f"Scraping schedules: {scrape_plan} for games between {start_dt} and {end_dt}")
+    print(f"Scraping schedules: {scrape_plan} for games between {start_dt} and {end_dt}") if start_dt is not None else None 
     all_dates = get_dates(start_dt, end_dt)
 
 scrape_ready = False
