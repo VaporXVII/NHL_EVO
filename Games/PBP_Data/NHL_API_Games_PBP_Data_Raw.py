@@ -129,7 +129,7 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
         latest_two_day_retry as (
 
             select /*+ broadcast (p) */
-                a.game_id
+                a.game_id,
                 (max(from_utc_timestamp(b.insert_dte, '{user_region}')::date) = max(p.current_run_dte))::boolean as latest_retry_today_ind
             from games a  
             cross join date_param p

@@ -150,6 +150,7 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
                     and a.game_date >= p.current_run_dte - interval 2 days
                     and b.period = 1 
                     and b.start_time = '00:00'
+                group by all
             )
             ,
             game_status as (
