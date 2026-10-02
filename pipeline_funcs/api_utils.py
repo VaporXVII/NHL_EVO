@@ -212,6 +212,15 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         try:
             scrape_ts_utc = datetime.now(UTC).replace(tzinfo = None)
             response = requests.get(url, timeout = time_out, headers = custom_headers)
+            #===================================================================================
+            #using below for debugging 
+            #===================================================================================
+            print("Status:", response.status_code)
+            print("Final URL:", response.url)
+            print("Request headers:", response.request.headers)
+            print("Response headers:", response.headers)
+            print("Body:", response.text[:1000])
+            #===================================================================================
             last_status = response.status_code
             new_rps, action = rate_limiter.record_status(last_status)
 
