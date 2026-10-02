@@ -203,7 +203,7 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
             from game_status a 
             where 1 = 1
                 and lower(a.which_game) not in ('not started', 'already loaded',
-                'missing_shift_data', 'unknown')
+                'missing retry', 'unknown')
             order by a.game_date desc, game_start_time_cst, a.game_id
             {limit_clause}
                   
