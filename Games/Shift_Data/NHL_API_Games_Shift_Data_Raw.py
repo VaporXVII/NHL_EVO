@@ -83,14 +83,17 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
             , 
             games_missing as (
 
-                select /*+ broadcast (b) */
+                select /*+ broadcast (p), broadcast (b) */
                     a.season,
                     a.game_id, 
                     b.next_retry_dte
-                from games a  
+                from games a 
+                cross join date_param p
                 inner join nhl_evo_raw.ops.games_missing_shift b 
                     on a.season = b.season 
                     and a.game_id = b.gameId
+                where 1 = 1
+                    and a.game_date < p.current_run_dte - interval 2 days
             )
             ,
             games_missing_retry as (
@@ -132,9 +135,26 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
                     and a.game_date = p.current_run_dte
             )
             ,
+            latest_two_day_retry as (
+
+                select /*+ broadcast (p) */
+                    a.game_id,
+                    (max(from_utc_timestamp(b.insert_dte, '{user_region}')::date) = max(p.current_run_dte))::boolean as latest_retry_today_ind
+                from games a 
+                cross join date_param p 
+                inner join nhl_evo_staged.games.shift_data b 
+                    on a.season = b.season 
+                    and a.game_id = b.game_id
+                where 1 = 1
+                    and a.game_date <> p.current_run_dte
+                    and a.game_date >= p.current_run_dte - interval 2 days
+                    and b.period = 1 
+                    and b.start_time = '00:00'
+            )
+            ,
             game_status as (
 
-                select /*+ broadcast (b), broadcast (c), broadcast (d), broadcast (e), broadcast (cs), broadcast (p) */
+                select /*+ broadcast (b), broadcast (c), broadcast (d), broadcast (e), broadcast (f), broadcast (cs), broadcast (p) */
                     a.*,
                     cs.cold_start_ind,
                     ---cold start takes precedent over all others 
@@ -146,11 +166,13 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
                         ---check to see if game was played before the 2 day lookback window (valid because if it's missing pbp data then it won't be in the missing_pbp_data table)
                         when a.game_date < p.current_run_dte - interval 2 days then 'already loaded' 
                         ---check to see if game was played within the last two days to capture most relevant record 
-                        when a.game_date <> p.current_run_dte and a.game_date >= p.current_run_dte - interval 2 days then 'last two'
+                        when a.game_date <> p.current_run_dte and a.game_date >= p.current_run_dte - interval 2 days and f.latest_retry_today_ind = false then 'last two'
                         ---check to see if game has ended today, will pause scrape until next day 
                         when e.game_id is not null then 'ended today' 
-                        ---check to see if game is in play today 
-                        when a.game_date = current_date() and p.current_run_time >= timestampadd(minute, 15, from_utc_timestamp(a.start_time_utc, '{user_region}')) then 'in play'
+                        ---check to see if game is in play today and had a start time at least 30 minutes before the time of the current_run
+                        ---shift data can be delayed much longer than PBP which starts at the time of game
+                        ---eliminating possibility of scraping game in play but no shift data has been collected as of yet and isolating game_id as part of nhl_evo_raw.ops.games_missing_shift
+                        when a.game_date = current_date() and p.current_run_time >= timestampadd(minute, 30, from_utc_timestamp(a.start_time_utc, '{user_region}')) then 'in play'
                         ---check to see if game is in play today but not yet started
                         when a.game_date = current_date() and from_utc_timestamp(p.current_run_time, '{user_region}') < from_utc_timestamp(a.start_time_utc, '{user_region}') then 'not started'
                         else 'unknown'
@@ -166,6 +188,8 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
                     and a.game_id = d.game_id 
                 left join games_ended_today e  
                     on a.game_id = e.game_id
+                left join latest_two_day_retry f 
+                    on a.game_id = f.game_id
                 cross join cold_start cs 
                 cross join date_param p
 
@@ -177,7 +201,8 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
                 concat('https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId=', a.game_id) as api_url
             from game_status a 
             where 1 = 1
-                and lower(a.which_game) not in ('not started', 'already loaded', 'missing shift data', 'unknown')
+                and lower(a.which_game) not in ('not started', 'already loaded',
+                'missing_shift_data', 'unknown')
             order by a.game_date desc, game_start_time_cst, a.game_id
             {limit_clause}
                   
@@ -330,50 +355,59 @@ def flush_api_data(api_data: list) -> int:
     else: 
         api_data_df = spark.createDataFrame(api_data)
 
+        #section below eliminated as result of NHL_EVO streaming tables 
+        #================================================================================================================================================
         #take sample of payload schemas
-        json_schema = (
+        #since batches are limited to 100 games regardless of number of games in play that day, using schema_of_json_agg to determine what shift schema is
+        # json_schema = (
 
-                #since batches are limited to 100 games regardless of number of games in play that day, using schema_of_json_agg to determine what shift schema is
-                api_data_df
-                .selectExpr("schema_of_json_agg(payload) as json_schema")
-                .first()["json_schema"]
-        )
+        #         #since batches are limited to 100 games regardless of number of games in play that day, using schema_of_json_agg to determine what shift schema is
+        #         api_data_df
+        #         .selectExpr("schema_of_json_agg(payload) as json_schema")
+        #         .first()["json_schema"]
+        # )
         
         #add column that represents the sample schema found above 
-        api_data_df = (
+        # api_data_df = (
 
-                api_data_df 
-                .withColumn("parsed_json", f.from_json(f.col("payload"), json_schema))
-        )
+        #         api_data_df 
+        #         .withColumn("parsed_json", f.from_json(f.col("payload"), json_schema))
+        # )
 
         #filter down to payloads that are not empty
-        non_empty_payloads = (
+        # non_empty_payloads = (
 
-                api_data_df 
-                .filter(
-                        (f.col("parsed_json.total") > 0) 
-                        | (f.size(f.col("parsed_json.data")) > 0)
-                )
-                .drop("parsed_json") 
+        #         api_data_df 
+        #         .filter(
+        #                 (f.col("parsed_json.total") > 0) 
+        #                 | (f.size(f.col("parsed_json.data")) > 0)
+        #         )
+        #         .drop("parsed_json") 
                 
-        )
+        # )
 
         #filter down to payloads that are empty
-        empty_payloads = (
+        # empty_payloads = (
 
-                api_data_df 
-                .filter(
-                        (f.col("parsed_json.total") == 0) 
-                        | (f.size(f.col("parsed_json.data")) == 0)
-                )
-                .drop("parsed_json")
-        )
+        #         api_data_df 
+        #         .filter(
+        #                 (f.col("parsed_json.total") == 0) 
+        #                 | (f.size(f.col("parsed_json.data")) == 0)
+        #         )
+        #         .drop("parsed_json")
+        # )
 
-        if not non_empty_payloads.isEmpty():
-                merge_insert_found(batch_data = non_empty_payloads)
+        # if not empty_payloads.isEmpty():
+        #         update_missing_games(batch_data = empty_payloads)
 
-        if not empty_payloads.isEmpty():
-                update_missing_games(batch_data = empty_payloads)
+        # if not non_empty_payloads.isEmpty():
+        #         merge_insert_found(batch_data = non_empty_payloads)
+
+        #section below eliminated as result of NHL_EVO streaming tables 
+        #================================================================================================================================================
+        
+        if not api_data_df.isEmpty():
+                merge_insert_found(batch_data = api_data_df)
 
 
  
