@@ -192,7 +192,7 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
             concat('https://api-web.nhle.com/v1/gamecenter/', a.game_id, '/play-by-play') as api_url
         from game_status a
         where 1 = 1
-            and lower(a.which_game) not in ('not started', 'already loaded', 'missing pbp data', 'unknown')
+            and lower(a.which_game) in ('in play', 'ended today', 'last two', 'missing retry')
         order by a.game_date desc, game_start_time_cst, a.game_id
         {limit_clause}
                                 
