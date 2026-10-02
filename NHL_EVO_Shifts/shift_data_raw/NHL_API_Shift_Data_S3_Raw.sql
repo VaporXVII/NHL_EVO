@@ -67,14 +67,9 @@ cluster by (season) as (
 )
 ;
 
-create or refresh streaming table ${bronze_catalog}.ops.games_missing_shift (
+create temporary view games_missing_shift_tmp as (
 
-    constraint invalid_missing_games expect (total_records = 0) on violation drop row
-
-)
-comment 'games missing shift data from shift_game_totals stream' as (
-
-     with shift_totals as (
+    with shift_totals as (
 
         select
             ---since payload will be empty, must use request_key for gameId
@@ -104,6 +99,66 @@ comment 'games missing shift data from shift_game_totals stream' as (
 
 )
 ;
+
+create flow games_missing_shift_flow 
+as auto cdc into ${bronze_catalog}.ops.games_missing_shift
+from stream(games_missing_shift_tmp)
+keys (season, gameId)
+apply as delete when total_records > 0 
+sequence by scrape_ts_utc
+stored as scd type 1
+;
+
+
+-- create or refresh streaming table ${bronze_catalog}.ops.games_missing_shift 
+-- comment 'games in current stream or historical games that are missing shift data'
+-- cluster by (season, gameId)
+-- flow replace using (season, gameId)
+-- sequence by scrape_ts_utc
+-- by name 
+-- select * 
+-- from stream(games_missing_shift_tmp)
+-- ;
+ 
+-- create or refresh streaming table ${bronze_catalog}.ops.games_missing_shift (
+
+--     constraint invalid_missing_games expect (total_records = 0) on violation drop row
+
+-- )
+-- comment 'games missing shift data from shift_game_totals stream' as (
+
+--     with shift_totals as (
+
+--     select
+--         ---since payload will be empty, must use request_key for gameId
+--         request_key as gameId,
+--         payload.total as total_records,
+--         coalesce(scrape_ts_utc, timestampadd(second, -30, s3_ingest_ts_utc)) as scrape_ts_utc,
+--         s3_ingest_ts_utc,
+--         ingest_ts_utc,
+--         py_source
+--     from stream ${bronze_catalog}.${api_schema}.shift_raw_data
+
+--     )
+
+--     select
+--         concat(
+--             substring(cast(gameId as string), 1, 4),
+--             cast(substring(cast(gameId as string), 1, 4) as integer) + 1
+--         ) as season,
+--         * except (scrape_ts_utc, s3_ingest_ts_utc, py_source),
+--         current_date() as first_attempt_dte,
+--         date_add(current_date(), 15) as next_retry_dte,
+--         scrape_ts_utc,
+--         s3_ingest_ts_utc,
+--         current_timestamp() as insert_dte,
+--         py_source 
+--     from shift_totals
+--     where 1 = 1
+--         and total_records = 0
+
+-- )
+-- ;
 
 create or refresh streaming table ${bronze_catalog}.${api_schema}.shift_raw_details
 comment 'raw unfiltered shift details from response json from NHL Shift API'
