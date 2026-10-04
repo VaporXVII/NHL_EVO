@@ -133,7 +133,7 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
             try:
                 row = future.result()
             except Exception as e:
-
+                print(f"Exception occured during scrape for {endpoint.lower()} request_key: {request_key}")
                 if request_key is not None:
                     req_key = request_key
 
