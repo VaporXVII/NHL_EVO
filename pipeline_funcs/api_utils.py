@@ -219,6 +219,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                 print(f"Adjusted RPS: {action}")
 
             if last_status == 200:
+                print(f"Response {last_status} received for {endpoint} request_key: {req_key}")
                 payload = response.json()
 
                 if isinstance(payload, list):
@@ -242,6 +243,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                     
 
             if last_status in (429, 502, 503, 504):
+                print(f"Response {last_status} received for {endpoint} request_key: {req_key}")
                 time.sleep((2 ** attempt) + random.random())
                 continue
 
