@@ -125,8 +125,8 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
     completed_count = 0
     with ThreadPoolExecutor(max_workers = max_workers) as executor:
 
-        future_to_url = {executor.submit(call_api, url, rate_limiter, endpoint = endpoint, request_key = None, custom_headers = optional_headers, s3_push = push_to_s3): url for url in urls}
-
+        future_to_url = {executor.submit(call_api, url, rate_limiter, endpoint = endpoint.lower(), request_key = None, custom_headers = optional_headers, s3_push = push_to_s3): url for url in urls}
+    
         for future in as_completed(future_to_url):
             url = future_to_url[future]
 
@@ -137,22 +137,22 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
                 if request_key is not None:
                     req_key = request_key
 
-                elif endpoint.lower() == "pbp":
+                elif endpoint == "pbp":
                     req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
 
-                elif endpoint.lower() == "shift":
+                elif endpoint == "shift":
                     req_key = int(url.split("gameId=")[-1])
 
-                elif endpoint.lower() == "player_search":
+                elif endpoint == "player_search":
                     req_key = url.split('/')[-1]
 
-                elif endpoint.lower() == "schedule":
+                elif endpoint == "schedule":
                     req_key = url.split('/')[-1]
 
-                elif endpoint.lower() == "team_details":
+                elif endpoint == "team_details":
                     req_key = None
                 
-                elif endpoint.lower() == "vegas_totals":
+                elif endpoint == "vegas_totals":
                     query_params = parse_qs(urlparse(url).query)
                     req_key = query_params.get("date", [None])[0]
 
@@ -219,7 +219,6 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                 print(f"Adjusted RPS: {action}")
 
             if last_status == 200:
-                print(f"Response {last_status} received for {endpoint} request_key: {req_key}")
                 payload = response.json()
 
                 if isinstance(payload, list):
