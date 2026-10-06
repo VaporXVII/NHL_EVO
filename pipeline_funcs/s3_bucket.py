@@ -13,7 +13,8 @@ def s3_return(bucket_name:str) -> Path:
                 "schedule": "/Volumes/nhl_evo_s3/games/schedule_data",
                 "pbp": "/Volumes/nhl_evo_s3/games/pbp_data",
                 "shift": "/Volumes/nhl_evo_s3/games/shift_data", 
-                "team_lines": "/Volumes/nhl_evo_s3/teams/team_lines_data"
+                "team_lines": "/Volumes/nhl_evo_s3/teams/team_lines_data",
+                "vegas_totals": "/Volumes/nhl_evo_s3/games/vegas_totals_data"
                 
                 }
         return Path(buckets[bucket_name])
@@ -32,7 +33,8 @@ def s3_dir_name(bucket_name: str) -> str:
                 "schedule": "game_date",
                 "pbp": "game_id",
                 "shift": "game_id",
-                "team_lines": "team_name"
+                "team_lines": "team_name",
+                "vegas_totals": "game_date"
         }
         return buckets[bucket_name]
 
@@ -45,7 +47,8 @@ def s3_schema_dir(bucket_name: str) -> str:
                 "schedule": "games",
                 "pbp": "games", 
                 "shift": "games", 
-                "team_lines": "teams"
+                "team_lines": "teams",
+                "vegas_totals": "games"
         }
 
         return schemas[bucket_name]
@@ -59,7 +62,8 @@ def s3_legacy_table_dir(bucket_name: str) -> str:
                 "schedule": "schedules",
                 "pbp": "pbp_data", 
                 "shift": "shift_data", 
-                "team_lines": "team_lines"
+                "team_lines": "team_lines",
+                "vegas_totals": "vegas_totals"
         }
 
         return legacy_tables[bucket_name]
@@ -116,13 +120,13 @@ def s3_delete(spark: SparkSession, bucket_name: str, lookback_window: int = None
                         and try_cast(s3_ingest_ts_utc as timestamp) is not null 
                         and try_cast(s3_ingest_ts_utc as date) >= date_sub(from_utc_timestamp(current_timestamp(), '{user_region}')::date, {lookback_window})  
                         """ if lookback_window else ""
-
+        s3_ext_vol = s3_return(bucket_name = bucket_name)
         files_to_delete = spark.sql(f"""
                                    
                         select 
                                  _metadata.file_path as s3_file_path
                         from read_files(
-                                '/Volumes/nhl_evo_s3/games/{bucket_name}_data',
+                                '{s3_ext_vol}',
                                 format => "json"
                         )                      
                         where 1 = 1
@@ -175,6 +179,11 @@ def s3_ingest(row: Row | dict, s3_ext_vol: str, backfill: bool = False) -> str:
                         "game_date": row["game_date"].isoformat(),
                         "game_id": row["game_id"],
                         **data_record
+                }
+        if s3_ext_vol == "schedule":
+                data_record = {
+                        **data_record, 
+                        "scrape_plan": row["scrape_plan"]
                 }
 
         with s3_file_path.open("w", encoding = "utf-8") as file: 
