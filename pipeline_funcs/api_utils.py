@@ -214,7 +214,8 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         throttle(rate_limiter = rate_limiter)
         try:
             scrape_ts_utc = datetime.now(UTC).replace(tzinfo = None)
-            response = requests.get(url, timeout = time_out, headers = custom_headers)
+            response = requests.get(url, timeout = time_out, headers = custom_headers if custom_headers else None, 
+                                    params = params_dict if params_dict else None)
             last_status = response.status_code
             new_rps, action = rate_limiter.record_status(last_status)
 
