@@ -120,6 +120,7 @@ def chunk_list(items, chunk_size):
 
 def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None, optional_headers: dict | None = None, push_to_s3: bool = False):
 
+    endpoint = endpoint.lower()
     rate_limiter = RateLim(rps = starting_rps)
     results = [] 
     completed_count = 0
@@ -133,11 +134,8 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
             try:
                 row = future.result()
             except Exception as e:
-                print(f"Exception occured during scrape for {endpoint.lower()} request_key: {request_key}")
-                if request_key is not None:
-                    req_key = request_key
-
-                elif endpoint == "pbp":
+                print(f"Exception occured during scrape for {endpoint} request_key: {request_key}")
+                if endpoint == "pbp":
                     req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
 
                 elif endpoint == "shift":
@@ -155,6 +153,9 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
                 elif endpoint == "vegas_totals":
                     query_params = parse_qs(urlparse(url).query)
                     req_key = query_params.get("date", [None])[0]
+
+                elif endpoint in ("powerplay", "penaltykill", "pp_toi", "pk_toi"):
+                    req_key = optional_headers
 
                 else:
                     req_key = url
@@ -179,29 +180,31 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
     return results 
 
 
-def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | int | None = None, max_attempts: int = 3, time_out: int = 20, custom_headers: dict | None = None, s3_push: bool = False):
+def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | int | None = None, max_attempts: int = 3, time_out: int = 20, custom_headers: dict | None = None, params_dict: dict | None = None, s3_push: bool = False):
     
-    if request_key is not None:
-        req_key = request_key
+    endpoint = endpoint.lower()
 
-    elif endpoint.lower() == "pbp":
+    if endpoint == "pbp":
         req_key = int(url.rsplit("/", 1)[0].rsplit("/", 1)[-1])
 
-    elif endpoint.lower() == "shift":
+    elif endpoint == "shift":
         req_key = int(url.split("gameId=")[-1])
 
-    elif endpoint.lower() == "player_search":
+    elif endpoint == "player_search":
         req_key = url.split('/')[-1]
     
-    elif endpoint.lower() == "schedule":
+    elif endpoint == "schedule":
         req_key = url.split('/')[-1]
     
-    elif endpoint.lower() == "team_details":
+    elif endpoint == "team_details":
         req_key = None
 
-    elif endpoint.lower() == "vegas_totals":
+    elif endpoint == "vegas_totals":
         query_params = parse_qs(urlparse(url).query)
         req_key = query_params.get("date", [None])[0]
+
+    elif endpoint in ("powerplay", "penaltykill", "pp_toi", "pk_toi"):
+        req_key = params_dict
 
     else:
         req_key = url
@@ -270,7 +273,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
 
         "endpoint": f"{endpoint}",
         "request_key": req_key,
-        "http_status": None,
+        "http_status": last_status,
         "payload": None,
         "api_url": url, 
         "scrape_ts_utc": None
