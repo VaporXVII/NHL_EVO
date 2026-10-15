@@ -2,6 +2,7 @@ from collections import deque
 import concurrent.futures 
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 import gc, json, random, threading, time, psutil, requests, certifi 
+from requests import Request
 from datetime import datetime, UTC 
 from urllib.parse import urlparse, parse_qs
 from pipeline_funcs.s3_bucket import s3_return, s3_create_dir, s3_ingest
@@ -118,15 +119,40 @@ def chunk_list(items, chunk_size):
         yield items[i:i + chunk_size]
 
 
-def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None, optional_headers: dict | None = None, push_to_s3: bool = False):
+def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_rps: float = 2.0, request_key: str | int | None = None, optional_headers: dict | list[dict] | None = None, push_to_s3: bool = False):
 
+    special_teams = ["powerplay", "penaltykill", "powerplaytime", "penaltykilltime"]
+    if endpoint in special_teams:
+
+        urls = [
+            (
+                Request("GET", url, params = params).prepare().url,
+                params
+            )
+            for url, params in zip(urls, optional_headers)
+        ]
     endpoint = endpoint.lower()
     rate_limiter = RateLim(rps = starting_rps)
     results = [] 
     completed_count = 0
+
     with ThreadPoolExecutor(max_workers = max_workers) as executor:
 
-        future_to_url = {executor.submit(call_api, url, rate_limiter, endpoint = endpoint.lower(), request_key = None, custom_headers = optional_headers, s3_push = push_to_s3): url for url in urls}
+        #future_to_url = {executor.submit(call_api, url, rate_limiter, endpoint = endpoint.lower(), request_key = request_key, custom_headers = optional_headers, s3_push = push_to_s3): url for url in urls}
+        future_to_url = {
+            executor.submit(
+                call_api,
+                item[0] if endpoint in special_teams else item,
+                rate_limiter,
+                endpoint = endpoint,
+                request_key = item[1] if endpoint in special_teams else request_key,
+                custom_headers = None if endpoint in special_teams else optional_headers,
+                s3_push = push_to_s3
+            ):
+            item[0] if endpoint in special_teams else item
+
+            for item in urls
+        }
     
         for future in as_completed(future_to_url):
             url = future_to_url[future]
@@ -154,7 +180,7 @@ def scrape_batch(urls: list[str], endpoint: str, max_workers: int = 5, starting_
                     query_params = parse_qs(urlparse(url).query)
                     req_key = query_params.get("date", [None])[0]
 
-                elif endpoint in ("powerplay", "penaltykill", "pp_toi", "pk_toi"):
+                elif endpoint in special_teams:
                     req_key = optional_headers
 
                 else:
@@ -194,7 +220,12 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         req_key = url.split('/')[-1]
     
     elif endpoint == "schedule":
+        #request key is game_date at then end of url
         req_key = url.split('/')[-1]
+        #scrape plan has been concatenated at start of url followed by 4 "----" symbols
+        scrape_plan = url.split('----')[0]
+        #remove scrape plan from url so that api response doesn't fail
+        url = url.split('----')[-1]
     
     elif endpoint == "team_details":
         req_key = None
@@ -203,8 +234,8 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         query_params = parse_qs(urlparse(url).query)
         req_key = query_params.get("date", [None])[0]
 
-    elif endpoint in ("powerplay", "penaltykill", "pp_toi", "pk_toi"):
-        req_key = params_dict
+    elif endpoint in ("powerplay", "penaltykill", "powerplaytime", "penaltykilltime"):
+        req_key = request_key
 
     else:
         req_key = url
@@ -214,7 +245,7 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
         throttle(rate_limiter = rate_limiter)
         try:
             scrape_ts_utc = datetime.now(UTC).replace(tzinfo = None)
-            response = requests.get(url, timeout = time_out, headers = custom_headers, params = params_dict)
+            response = requests.get(url, timeout = time_out, headers = custom_headers)
             last_status = response.status_code
             new_rps, action = rate_limiter.record_status(last_status)
 
@@ -236,7 +267,13 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                     "api_url": url, 
                     "scrape_ts_utc": scrape_ts_utc,
 
-                } 
+                }
+
+                if endpoint == "schedule":
+                    api_response = {
+                            **api_response,
+                            "scrape_plan": scrape_plan
+                    } 
 
                 if s3_push:
                     print(s3_ingest(api_response, s3_ext_vol = endpoint, backfill = False))
@@ -258,6 +295,12 @@ def call_api(url: str, rate_limiter: RateLim, endpoint: str, request_key: str | 
                 "api_url": url,
                 "scrape_ts_utc": scrape_ts_utc
             } 
+
+            if api_response == "schedule":
+                    api_response = {
+                            **api_response,
+                            "scrape_plan": scrape_plan
+                    }
 
             if s3_push:
                 print(s3_ingest(api_response, s3_ext_vol = endpoint, backfill = False))
