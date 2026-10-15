@@ -197,6 +197,7 @@ def find_games(limit_n: int | None = None, raw_schema: str = None) -> DataFrame:
         {limit_clause}
                                 
 """)
+    
 
 def update_missing_games(batch_data: DataFrame) -> None:
 
