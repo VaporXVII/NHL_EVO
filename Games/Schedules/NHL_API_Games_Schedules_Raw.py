@@ -65,7 +65,7 @@ schedules = spark.sql(f"""
                         from nhl_data_staged.games.schedules a  
                         cross join date_param p 
                         where 1 = 1
-                            and game_date >= p.current_run_dte
+                            and p.current_run_dte between a.regular_season_start_date and a.playoff_end_date
 
                     )
 
@@ -76,49 +76,20 @@ schedules = spark.sql(f"""
                         max(a.regular_season_end_date)::date as regseason_end_date,
                         max(a.game_date) filter (where a.game_type = 2)::date as regseason_last_game_date,
                         max(a.playoff_end_date)::date as playoff_end_date,
-                        (date_diff(min(p.current_run_dte), min(a.game_date)) = 7)::boolean as run_scrape_ind,
+                        (date_diff(min(p.current_run_dte), min(a.game_date)) = 15)::boolean as run_scrape_ind,
                         (max(a.regular_season_end_date) >= date_sub(max(a.game_date) filter (where a.game_type = 2), 1))::boolean as sched_fully_loaded,
-                        max(b.start_of_rs_ind)::boolean as start_of_rs_ind
+                        max(b.start_of_rs_ind)::boolean as start_of_rs_ind,
+                        max(p.current_run_dte = a.regular_season_end_date - interval 1 day)::boolean as day_before_rs_end_ind
                     from nhl_data_staged.games.schedules a
                     cross join recent_season b   
                     cross join date_param p 
                     where 1 = 1
                         and a.game_type between 1 and 3      
-                        and a.game_date >= b.start_date 
+                        and a.game_date >= b.start_date
                         
 
 """)
-missing_dates = spark.sql(f"""
-    
-                    with dates as (
-                    
-                        select 
-                            min(request_key)::date as start_date,
-                            max(request_key)::date as end_date 
-                        from nhl_data_raw.games.schedules
-                        where 1 = 1
-                            and request_key >= from_utc_timestamp(current_timestamp(), '{user_region}')::date 
-
-                    )
-                    , 
-                    dates_list as (
-
-                    ---producing a list of dates starting from the start_date to the end_date, spaced out in 7 day increments per NHL API response
-                        select explode(sequence(start_date, end_date, interval 7 days)) as game_date 
-                        from dates 
-
-                    )
-                    
-                    
-                    select 
-                        a.game_date 
-                    from dates_list a 
-                    left anti join nhl_data_staged.games.schedules c 
-                        on a.game_date = c.game_date
-
-""")
-ready = True
-missing_ready = not missing_dates.isEmpty()
+ready = not schedules.isEmpty()
 
 if ready: 
     
@@ -127,7 +98,9 @@ if ready:
     schedule_info = (
 
             schedules
-            .select("preseason_start_date", "regseason_start_date", "regseason_end_date", "regseason_last_game_date", "playoff_end_date", "sched_fully_loaded", "start_of_rs_ind")
+            .select(
+                    "preseason_start_date", "regseason_start_date", "regseason_end_date", "regseason_last_game_date", 
+                    "playoff_end_date", "sched_fully_loaded", "start_of_rs_ind", "run_scrape_ind", "day_before_rs_end_ind")
             .collect()[0]
     )
     pre_season_start_date = to_date(schedule_info["preseason_start_date"])
@@ -137,6 +110,8 @@ if ready:
     playoff_end_date = to_date(schedule_info["playoff_end_date"])
     schedule_fully_loaded = schedule_info["sched_fully_loaded"]
     start_of_rs_ind = schedule_info["start_of_rs_ind"]
+    run_scrape_ind = schedule_info["run_scrape_ind"]
+    day_before_rs_end_ind = schedule_info["day_before_rs_end_ind"]
 
     gap_window = 30
     #pipeline has never been ran and user runs script for the first time
@@ -160,9 +135,15 @@ if ready:
         end_dt = regseason_end_date 
         scrape_plan = "sec_scrape_on_first_day_of_regular_season"
     
+    elif run_scrape_ind: 
+
+        start_dt = today 
+        end_dt = regseason_end_date
+        scrape_plan = "sec_scrape_every_15_season_days"
+
     #pipeline has been run before and is being ran again on the same day as the last game of the regular season 
     #(just in case playoff schedules have been established and loaded)
-    elif (regseason_start_date is not None and regseason_start_date <= today <= regseason_last_game_date):
+    elif (regseason_start_date is not None and today == day_before_rs_end_ind):
 
         start_dt = regseason_end_date
         end_dt = playoff_end_date
@@ -173,6 +154,7 @@ if ready:
         
         start_dt = None
         end_dt = None 
+        scrape_plan = "date not eligible for scrape"
     
     #outlier scenario in case NHL doesn't have playoff start date set when the regular season schedule is released 
     elif (regseason_start_date is not None and regseason_end_date is not None and playoff_end_date is None and 1 <= today.month <= 3 and today.day in (1, 15, 28)):
@@ -240,18 +222,12 @@ if ready:
         end_dt = None
         scrape_plan = "issue_found"
 
-    print(f"Scraping schedules: {scrape_plan} for games between {start_dt} and {end_dt}") if start_dt is not None else None 
+    print(f"Scraping schedules: {scrape_plan}" if start_dt is None else f"Scraping schedules: {scrape_plan} for games between {start_dt} and {end_dt}")   
     all_dates = get_dates(start_dt, end_dt)
 
 scrape_ready = False
-if missing_ready: 
-    missing_dates = missing_dates.select("game_date").collect()
-    missing_dates_set = {str(date[0]) for date in missing_dates}
-else: 
-    missing_dates_set = {}
-all_dates_set = all_dates.union(missing_dates_set)
-game_urls = sorted(set(f"https://api-web.nhle.com/v1/schedule/{d}" for d in all_dates_set))
-if game_urls: 
+if all_dates:
+    game_urls = sorted(set(f"{scrape_plan}----https://api-web.nhle.com/v1/schedule/{d}" for d in all_dates)) 
     scrape_ready = True
 
 insert_ready = False
@@ -315,7 +291,7 @@ if insert_ready:
                         s.http_status,
                         s.payload,
                         s.api_url,
-                        '{scrape_plan}' as scrape_plan,
+                        cast('{scrape_plan}' as string) as scrape_plan,
                         from_json(s.payload, '{sched_schema}') as payload_json
                     from schedules_insert_tmp s
                     where 1 = 1
