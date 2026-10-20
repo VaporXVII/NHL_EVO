@@ -124,15 +124,7 @@ cluster by (season, gameDate, game_id) as (
 )
 ;
 
-create or refresh streaming table ${bronze_catalog}.${api_schema}.pbp_team_rosters ( 
-
-    --ensure both team id and player id is not null otherwise drop
-    constraint valid_team_id expect (teamId is not null) on violation drop row,
-    constraint valid_player_id expect (playerId is not null) on violation drop row
-
-)
-comment 'team roster details from pbp_game_details stream'
-cluster by (season, gameDate, teamId) as (
+create temporary view pbp_team_rosters_tmp as (
 
     with layer_one as (
 
@@ -171,8 +163,74 @@ cluster by (season, gameDate, teamId) as (
             py_source
         from layer_three
 
+
 )
 ;
+
+create or refresh streaming table ${bronze_catalog}.${api_schema}.pbp_team_rosters
+comment 'team roster details from pbp_game_details stream'
+cluster by (season, gameDate, teamId)
+;
+
+create flow pbp_team_rosters_flow 
+as auto cdc into ${bronze_catalog}.${api_schema}.pbp_team_rosters 
+from stream(pbp_team_rosters_tmp)
+keys (season, game_id, playerId)
+apply as delete when teamId is null
+sequence by scrape_ts_utc
+stored as scd type 1
+;
+
+
+-- create or refresh streaming table ${bronze_catalog}.${api_schema}.pbp_team_rosters ( 
+
+--     --ensure both team id and player id is not null otherwise drop
+--     constraint valid_team_id expect (teamId is not null) on violation drop row,
+--     constraint valid_player_id expect (playerId is not null) on violation drop row
+
+-- )
+-- comment 'team roster details from pbp_game_details stream'
+-- cluster by (season, gameDate, teamId) as (
+
+--     with layer_one as (
+
+--         select 
+--             season, game_id, gameDate, explode(rosterSpots) as rosterSpots, scrape_ts_utc, s3_ingest_ts_utc, ingest_ts_utc, py_source
+--         from stream ${bronze_catalog}.${api_schema}.pbp_game_details
+
+--     )
+--     ,
+--     layer_two as (
+
+--         select 
+--             season, game_id, gameDate, rosterSpots.*, scrape_ts_utc, s3_ingest_ts_Utc, ingest_ts_utc, py_source
+--         from layer_one
+
+--     )
+--     ,
+--     layer_three as (
+
+--         select 
+--             * except (firstName, lastName, scrape_ts_utc, s3_ingest_ts_utc, ingest_ts_utc, py_source),
+--             firstName.default as firstName,
+--             lastName.default as lastName,
+--             scrape_ts_utc, s3_ingest_ts_utc, ingest_ts_utc, py_source 
+--         from layer_two 
+
+--     )
+
+--         select 
+--             * except (headshot, scrape_ts_utc, s3_ingest_ts_utc, ingest_ts_utc, py_source),
+--             headshot, 
+--             scrape_ts_utc,
+--             s3_ingest_ts_utc,
+--             ingest_ts_utc, 
+--             current_timestamp() as insert_dte,
+--             py_source
+--         from layer_three
+
+-- )
+-- ;
 
 create or refresh streaming table ${bronze_catalog}.${api_schema}.pbp_game_status (
 
