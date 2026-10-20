@@ -67,6 +67,7 @@ cluster by (season) as (
 )
 ;
 
+
 create temporary view games_missing_shift_tmp as (
 
     with shift_totals as (
@@ -98,6 +99,12 @@ create temporary view games_missing_shift_tmp as (
     from shift_totals
 
 )
+;
+
+
+create or refresh streaming table ${bronze_catalog}.ops.games_missing_shift 
+comment 'games in current stream or historical games that are missing shift data'
+cluster by (season, gameId)
 ;
 
 create flow games_missing_shift_flow 
